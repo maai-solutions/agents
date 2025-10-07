@@ -8,11 +8,33 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 import json
 import asyncio
+import os
+import sys
 from datetime import datetime
 from loguru import logger
 
 from linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
 from linus.agents.agent.tools import get_default_tools, create_custom_tool
+
+
+# Configure logging early
+os.makedirs("logs", exist_ok=True)
+
+# Remove default handler and add custom ones
+logger.remove()
+logger.add(
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+    level="INFO"
+)
+logger.add(
+    "logs/agent_api.log",
+    rotation="10 MB",
+    retention="7 days",
+    compression="zip",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}",
+    level="DEBUG"
+)
 
 
 class Settings(BaseSettings):
@@ -404,12 +426,9 @@ async def test_scenarios():
 
 if __name__ == "__main__":
     import uvicorn
-    import os
 
-    # Create logs directory if it doesn't exist
-    os.makedirs("logs", exist_ok=True)
-
-    logger.add("logs/agent_api.log", rotation="10 MB")
+    logger.info(f"Starting {settings.app_name} v{settings.app_version}")
+    logger.info(f"Logs directory: {os.path.abspath('logs')}")
 
     uvicorn.run(
         "app:app",

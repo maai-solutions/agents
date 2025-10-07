@@ -1,14 +1,92 @@
 """Custom Agent implementation for Gemma3:27b without native tool support."""
 
 from typing import List, Dict, Any, Optional, Tuple, Type, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
+import time
+import asyncio
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langchain_community.chat_models import ChatOpenAI
 from pydantic import BaseModel, Field
 from loguru import logger
+
+# Import memory components
+try:
+    from .memory import MemoryManager, create_memory_manager
+    MEMORY_AVAILABLE = True
+except ImportError:
+    MEMORY_AVAILABLE = False
+    logger.warning("Memory module not available")
+
+# Import graph components for state compatibility
+try:
+    from ..graph.state import SharedState
+    GRAPH_STATE_AVAILABLE = True
+except ImportError:
+    GRAPH_STATE_AVAILABLE = False
+    SharedState = None
+
+
+class StateWrapper:
+    """Wrapper to provide dict-like interface to SharedState.
+
+    This allows agents to use SharedState transparently while maintaining
+    backward compatibility with code that expects a dict-like state object.
+    """
+
+    def __init__(self, shared_state: 'SharedState'):
+        """Initialize wrapper with SharedState instance.
+
+        Args:
+            shared_state: The SharedState instance to wrap
+        """
+        self._shared_state = shared_state
+
+    def __getitem__(self, key: str) -> Any:
+        """Get item using dict syntax: state[key]."""
+        value = self._shared_state.get(key)
+        if value is None:
+            raise KeyError(f"Key '{key}' not found in state")
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set item using dict syntax: state[key] = value."""
+        self._shared_state.set(key, value, source="agent")
+
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists using 'in' operator."""
+        return self._shared_state.get(key) is not None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get value with default fallback."""
+        return self._shared_state.get(key, default=default)
+
+    def keys(self) -> List[str]:
+        """Get all keys in state."""
+        return list(self._shared_state.get_all().keys())
+
+    def values(self) -> List[Any]:
+        """Get all values in state."""
+        return list(self._shared_state.get_all().values())
+
+    def items(self) -> List[Tuple[str, Any]]:
+        """Get all key-value pairs."""
+        return list(self._shared_state.get_all().items())
+
+    def update(self, other: Dict[str, Any]) -> None:
+        """Update state with dict values."""
+        for key, value in other.items():
+            self._shared_state.set(key, value, source="agent")
+
+    def __repr__(self) -> str:
+        """String representation."""
+        return f"StateWrapper({self._shared_state.get_all()})"
+
+    def __len__(self) -> int:
+        """Return number of items in state."""
+        return len(self._shared_state.get_all())
 
 
 @dataclass
@@ -29,6 +107,66 @@ class TaskExecution:
     result: Optional[Any] = None
 
 
+@dataclass
+class AgentMetrics:
+    """Metrics collected during agent execution."""
+    total_iterations: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+    execution_time_seconds: float = 0.0
+    reasoning_calls: int = 0
+    tool_executions: int = 0
+    completion_checks: int = 0
+    llm_calls: int = 0
+    successful_tool_calls: int = 0
+    failed_tool_calls: int = 0
+    task_completed: bool = False
+    iterations_to_completion: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert metrics to dictionary."""
+        return {
+            "total_iterations": self.total_iterations,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_tokens,
+            "execution_time_seconds": round(self.execution_time_seconds, 3),
+            "reasoning_calls": self.reasoning_calls,
+            "tool_executions": self.tool_executions,
+            "completion_checks": self.completion_checks,
+            "llm_calls": self.llm_calls,
+            "successful_tool_calls": self.successful_tool_calls,
+            "failed_tool_calls": self.failed_tool_calls,
+            "task_completed": self.task_completed,
+            "iterations_to_completion": self.iterations_to_completion,
+            "avg_tokens_per_llm_call": round(self.total_tokens / self.llm_calls, 2) if self.llm_calls > 0 else 0,
+            "success_rate": round(self.successful_tool_calls / self.tool_executions, 2) if self.tool_executions > 0 else 0
+        }
+
+
+@dataclass
+class AgentResponse:
+    """Complete agent response with result and metrics."""
+    result: Union[str, BaseModel]
+    metrics: AgentMetrics
+    execution_history: List[Dict[str, Any]] = field(default_factory=list)
+    completion_status: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert response to dictionary."""
+        result_value = self.result
+        if isinstance(self.result, BaseModel):
+            result_value = self.result.model_dump()
+
+        return {
+            "result": result_value,
+            "metrics": self.metrics.to_dict(),
+            "execution_history": self.execution_history,
+            "completion_status": self.completion_status
+        }
+
+
 class Agent:
     """Base Agent class with langchain integration."""
 
@@ -40,7 +178,8 @@ class Agent:
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Dict[str, Any]] = None
+        state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+        memory_manager: Optional['MemoryManager'] = None
     ):
         """Initialize the base agent.
 
@@ -51,7 +190,8 @@ class Agent:
             input_schema: Optional Pydantic BaseModel for structured input validation
             output_schema: Optional Pydantic BaseModel for structured output
             output_key: Optional key to save output in shared state
-            state: Optional shared state dictionary between agents
+            state: Optional shared state (dict or SharedState from graph module)
+            memory_manager: Optional memory manager for context persistence
         """
         self.llm = llm
         self.tools = tools
@@ -60,7 +200,19 @@ class Agent:
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.output_key = output_key
-        self.state = state if state is not None else {}
+
+        # Handle both dict and SharedState
+        if state is None:
+            self.state = {}
+            self._shared_state = None
+        elif GRAPH_STATE_AVAILABLE and isinstance(state, SharedState):
+            self._shared_state = state
+            self.state = StateWrapper(state)  # Wrapper for backward compatibility
+        else:
+            self.state = state
+            self._shared_state = None
+
+        self.memory_manager = memory_manager
 
     def run(self, input_data: Union[str, BaseModel, Dict[str, Any]]) -> Union[str, BaseModel]:
         """Run the agent on the given input.
@@ -148,6 +300,35 @@ class Agent:
         if self.verbose:
             logger.info(message)
 
+    def _update_token_usage(self, response: Any):
+        """Extract and update token usage from LLM response.
+
+        Args:
+            response: The response from the LLM call
+        """
+        if self.current_metrics is None:
+            return
+
+        self.current_metrics.llm_calls += 1
+
+        # Try to extract token usage from response
+        try:
+            if hasattr(response, 'response_metadata'):
+                metadata = response.response_metadata
+                if 'token_usage' in metadata:
+                    usage = metadata['token_usage']
+                    self.current_metrics.total_input_tokens += usage.get('prompt_tokens', 0)
+                    self.current_metrics.total_output_tokens += usage.get('completion_tokens', 0)
+                    self.current_metrics.total_tokens += usage.get('total_tokens', 0)
+            # Fallback: estimate tokens if metadata not available
+            elif hasattr(response, 'content'):
+                # Rough estimation: ~4 characters per token
+                estimated_tokens = len(response.content) // 4
+                self.current_metrics.total_output_tokens += estimated_tokens
+                self.current_metrics.total_tokens += estimated_tokens
+        except Exception as e:
+            logger.debug(f"Could not extract token usage: {e}")
+
 
 class ReasoningAgent(Agent):
     """Agent that uses two-call approach for Gemma3:27b without tool support.
@@ -164,12 +345,32 @@ class ReasoningAgent(Agent):
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Dict[str, Any]] = None
+        state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+        max_iterations: int = 10,
+        memory_manager: Optional['MemoryManager'] = None,
+        memory_context_ratio: float = 0.3
     ):
-        """Initialize the reasoning agent."""
-        super().__init__(llm, tools, verbose, input_schema, output_schema, output_key, state)
+        """Initialize the reasoning agent.
+
+        Args:
+            llm: LangChain ChatOpenAI instance
+            tools: List of available tools
+            verbose: Whether to print debug information
+            input_schema: Optional Pydantic BaseModel for structured input validation
+            output_schema: Optional Pydantic BaseModel for structured output
+            output_key: Optional key to save output in shared state
+            state: Optional shared state (dict or SharedState from graph module)
+            max_iterations: Maximum number of reasoning-execution loops before stopping
+            memory_manager: Optional memory manager for context persistence
+            memory_context_ratio: Ratio of context window to use for memory (0.0 to 1.0)
+        """
+        super().__init__(llm, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
         self.reasoning_prompt = self._create_reasoning_prompt()
         self.execution_prompt = self._create_execution_prompt()
+        self.completion_check_prompt = self._create_completion_check_prompt()
+        self.max_iterations = max_iterations
+        self.current_metrics: Optional[AgentMetrics] = None
+        self.memory_context_ratio = max(0.0, min(1.0, memory_context_ratio))  # Clamp to 0-1
     
     def _create_reasoning_prompt(self) -> str:
         """Create the prompt template for the reasoning phase."""
@@ -221,61 +422,381 @@ Example: {{"query": "search term", "limit": 10}}
 
 Tool arguments:"""
 
-    def run(self, input_data: Union[str, BaseModel, Dict[str, Any]]) -> Union[str, BaseModel]:
-        """Run the agent using the two-call approach.
+    def _create_completion_check_prompt(self) -> str:
+        """Create the prompt template for checking task completion."""
+        return """You are an AI assistant that validates task completion.
+
+Original Request: {original_request}
+
+Execution History:
+{execution_history}
+
+Based on the original request and the execution history, determine if the task has been completed successfully.
+
+Respond in the following JSON format:
+{{
+    "is_complete": true/false,
+    "reasoning": "Explanation of why the task is or isn't complete",
+    "missing_steps": ["List of steps still needed (empty if complete)"],
+    "next_action": "What should be done next (or 'none' if complete)"
+}}
+
+Response:"""
+
+    def run(self, input_data: Union[str, BaseModel, Dict[str, Any]], return_metrics: bool = True) -> Union[str, BaseModel, AgentResponse]:
+        """Run the agent using an iterative reasoning-execution loop with validation.
 
         Args:
             input_data: The user's request (string, Pydantic model, or dict)
+            return_metrics: If True, return AgentResponse with metrics; if False, return only the result
 
         Returns:
-            The final response or result (string or Pydantic model)
+            AgentResponse (if return_metrics=True) or just the result (if return_metrics=False)
         """
+        # Initialize metrics
+        metrics = AgentMetrics()
+        self.current_metrics = metrics
+        start_time = time.time()
+
         # Validate and convert input
         input_text = self._validate_and_convert_input(input_data)
-        logger.debug(f"[RUN] Processing request: {input_text}")
+        logger.info(f"[RUN] Starting task: {input_text}")
 
-        # Phase 1: Reasoning
-        reasoning_result = self._reasoning_call(input_text)
-        logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
-
-        if not reasoning_result.has_sufficient_info:
-            result = f"I need more information to complete this task. {reasoning_result.reasoning}"
-            return self._format_output(result)
-
-        # Phase 2: Execution
-        results = []
-        context = input_text
-
-        # Add state context if available
-        if self.state:
-            state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in self.state.items()})}"
-            context = context + state_context
-            logger.debug(f"[RUN] Added state context: {state_context}")
-
-        for task_data in reasoning_result.tasks:
-            task = TaskExecution(
-                description=task_data["description"],
-                tool_name=task_data.get("tool_name")
+        # Store user input in memory
+        if self.memory_manager:
+            self.memory_manager.add_memory(
+                content=f"User: {input_text}",
+                metadata={"role": "user", "type": "input"},
+                importance=1.0,
+                entry_type="interaction"
             )
 
-            if task.tool_name:
-                # Generate tool arguments and execute
-                task_result = self._execute_task_with_tool(task, context)
-                results.append(task_result)
-                # Update context with results for subsequent tasks
-                context = f"{context}\n\nPrevious result: {task_result}"
-            else:
-                # Direct LLM response without tool
-                response = self._generate_response(task.description, context)
-                results.append(response)
-                context = f"{context}\n\nPrevious result: {response}"
+        # Track execution history for all iterations
+        execution_history = []
+        iteration = 0
+        is_complete = False
+        completion_status = None
 
-        # Combine results into final response
-        final_result = self._format_final_response(input_text, results)
+        # Agent loop: keep reasoning and executing until task is complete or max iterations reached
+        while not is_complete and iteration < self.max_iterations:
+            iteration += 1
+            logger.info(f"[RUN] === Iteration {iteration}/{self.max_iterations} ===")
+
+            # Phase 1: Reasoning
+            # Build context from previous iterations and memory
+            context = input_text
+
+            # Add memory context if available
+            if self.memory_manager:
+                memory_tokens = int(self.memory_manager.max_context_tokens * self.memory_context_ratio)
+                memory_context = self.memory_manager.get_context(
+                    max_tokens=memory_tokens,
+                    include_summary=True,
+                    query=input_text
+                )
+                if memory_context:
+                    context = f"{memory_context}\n\n=== Current Task ===\n{context}"
+                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
+
+            if self.state:
+                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in self.state.items()})}"
+                context = context + state_context
+
+            if execution_history:
+                history_context = "\n\nPrevious execution results:\n" + "\n".join([
+                    f"- {item['task']}: {item['result'][:200]}" for item in execution_history[-5:]  # Last 5 items
+                ])
+                context = context + history_context
+
+            reasoning_result = self._reasoning_call(context)
+            logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
+
+            if not reasoning_result.has_sufficient_info:
+                result = f"I need more information to complete this task. {reasoning_result.reasoning}"
+                logger.warning(f"[RUN] Insufficient information: {reasoning_result.reasoning}")
+                return self._format_output(result)
+
+            # Phase 2: Execute planned tasks
+            iteration_results = []
+            for task_data in reasoning_result.tasks:
+                task = TaskExecution(
+                    description=task_data["description"],
+                    tool_name=task_data.get("tool_name")
+                )
+
+                logger.info(f"[RUN] Executing task: {task.description}")
+
+                if task.tool_name:
+                    # Generate tool arguments and execute
+                    task_result = self._execute_task_with_tool(task, context)
+                    iteration_results.append(task_result)
+
+                    # Record in execution history
+                    execution_history.append({
+                        "iteration": iteration,
+                        "task": task.description,
+                        "tool": task.tool_name,
+                        "result": task_result,
+                        "status": "completed" if task.completed else "failed"
+                    })
+
+                    # Update context with results for subsequent tasks
+                    context = f"{context}\n\nLatest result: {task_result}"
+                else:
+                    # Direct LLM response without tool
+                    response = self._generate_response(task.description, context)
+                    iteration_results.append(response)
+
+                    execution_history.append({
+                        "iteration": iteration,
+                        "task": task.description,
+                        "tool": None,
+                        "result": response,
+                        "status": "completed"
+                    })
+
+                    context = f"{context}\n\nLatest result: {response}"
+
+            # Phase 3: Check if task is complete
+            completion_status = self._check_completion(input_text, execution_history)
+            is_complete = completion_status["is_complete"]
+
+            logger.info(f"[RUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
+
+            if not is_complete and iteration < self.max_iterations:
+                logger.info(f"[RUN] Task not complete. Next action: {completion_status['next_action']}")
+                logger.info(f"[RUN] Missing steps: {completion_status['missing_steps']}")
+                # Loop continues with updated context
+            elif not is_complete and iteration >= self.max_iterations:
+                logger.warning(f"[RUN] Max iterations ({self.max_iterations}) reached without completion")
+                break
+
+        # Calculate final metrics
+        metrics.total_iterations = iteration
+        metrics.execution_time_seconds = time.time() - start_time
+        metrics.task_completed = is_complete
+        metrics.iterations_to_completion = iteration if is_complete else None
+
+        # Task completed successfully
+        if is_complete:
+            logger.info(f"[RUN] Task completed successfully in {iteration} iteration(s)")
+        else:
+            logger.warning(f"[RUN] Task incomplete after {iteration} iteration(s)")
+
+        final_result = self._format_final_response_with_history(input_text, execution_history, completion_status)
 
         # Format output according to schema and save to state
-        return self._format_output(final_result)
-    
+        formatted_result = self._format_output(final_result)
+
+        # Store agent response in memory
+        if self.memory_manager:
+            self.memory_manager.add_memory(
+                content=f"Assistant: {str(formatted_result)[:500]}",  # Limit length
+                metadata={
+                    "role": "assistant",
+                    "type": "output",
+                    "iterations": iteration,
+                    "completed": is_complete
+                },
+                importance=1.0,
+                entry_type="interaction"
+            )
+
+            # Log memory stats
+            mem_stats = self.memory_manager.get_memory_stats()
+            logger.debug(f"[MEMORY] Stats: {mem_stats}")
+
+        # Log final metrics
+        logger.info(f"[METRICS] {metrics.to_dict()}")
+
+        # Return based on return_metrics flag
+        if return_metrics:
+            return AgentResponse(
+                result=formatted_result,
+                metrics=metrics,
+                execution_history=execution_history,
+                completion_status=completion_status
+            )
+        else:
+            return formatted_result
+
+    async def arun(self, input_data: Union[str, BaseModel, Dict[str, Any]], return_metrics: bool = True) -> Union[str, BaseModel, AgentResponse]:
+        """Async version: Run the agent using an iterative reasoning-execution loop with validation.
+
+        Args:
+            input_data: The user's request (string, Pydantic model, or dict)
+            return_metrics: If True, return AgentResponse with metrics; if False, return only the result
+
+        Returns:
+            AgentResponse (if return_metrics=True) or just the result (if return_metrics=False)
+        """
+        # Initialize metrics
+        metrics = AgentMetrics()
+        self.current_metrics = metrics
+        start_time = time.time()
+
+        # Validate and convert input
+        input_text = self._validate_and_convert_input(input_data)
+        logger.info(f"[ARUN] Starting task: {input_text}")
+
+        # Store user input in memory
+        if self.memory_manager:
+            self.memory_manager.add_memory(
+                content=f"User: {input_text}",
+                metadata={"role": "user", "type": "input"},
+                importance=1.0,
+                entry_type="interaction"
+            )
+
+        # Track execution history for all iterations
+        execution_history = []
+        iteration = 0
+        is_complete = False
+        completion_status = None
+
+        # Agent loop: keep reasoning and executing until task is complete or max iterations reached
+        while not is_complete and iteration < self.max_iterations:
+            iteration += 1
+            logger.info(f"[ARUN] === Iteration {iteration}/{self.max_iterations} ===")
+
+            # Phase 1: Reasoning
+            # Build context from previous iterations and memory
+            context = input_text
+
+            # Add memory context if available
+            if self.memory_manager:
+                memory_tokens = int(self.memory_manager.max_context_tokens * self.memory_context_ratio)
+                memory_context = self.memory_manager.get_context(
+                    max_tokens=memory_tokens,
+                    include_summary=True,
+                    query=input_text
+                )
+                if memory_context:
+                    context = f"{memory_context}\n\n=== Current Task ===\n{context}"
+                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
+
+            if self.state:
+                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in self.state.items()})}"
+                context = context + state_context
+
+            if execution_history:
+                history_context = "\n\nPrevious execution results:\n" + "\n".join([
+                    f"- {item['task']}: {item['result'][:200]}" for item in execution_history[-5:]  # Last 5 items
+                ])
+                context = context + history_context
+
+            reasoning_result = await self._areasoning_call(context)
+            logger.debug(f"[ARUN] Reasoning result: {reasoning_result}")
+
+            if not reasoning_result.has_sufficient_info:
+                result = f"I need more information to complete this task. {reasoning_result.reasoning}"
+                logger.warning(f"[ARUN] Insufficient information: {reasoning_result.reasoning}")
+                return self._format_output(result)
+
+            # Phase 2: Execute planned tasks
+            iteration_results = []
+            for task_data in reasoning_result.tasks:
+                task = TaskExecution(
+                    description=task_data["description"],
+                    tool_name=task_data.get("tool_name")
+                )
+
+                logger.info(f"[ARUN] Executing task: {task.description}")
+
+                if task.tool_name:
+                    # Generate tool arguments and execute
+                    task_result = await self._aexecute_task_with_tool(task, context)
+                    iteration_results.append(task_result)
+
+                    # Record in execution history
+                    execution_history.append({
+                        "iteration": iteration,
+                        "task": task.description,
+                        "tool": task.tool_name,
+                        "result": task_result,
+                        "status": "completed" if task.completed else "failed"
+                    })
+
+                    # Update context with results for subsequent tasks
+                    context = f"{context}\n\nLatest result: {task_result}"
+                else:
+                    # Direct LLM response without tool
+                    response = await self._agenerate_response(task.description, context)
+                    iteration_results.append(response)
+
+                    execution_history.append({
+                        "iteration": iteration,
+                        "task": task.description,
+                        "tool": None,
+                        "result": response,
+                        "status": "completed"
+                    })
+
+                    context = f"{context}\n\nLatest result: {response}"
+
+            # Phase 3: Check if task is complete
+            completion_status = await self._acheck_completion(input_text, execution_history)
+            is_complete = completion_status["is_complete"]
+
+            logger.info(f"[ARUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
+
+            if not is_complete and iteration < self.max_iterations:
+                logger.info(f"[ARUN] Task not complete. Next action: {completion_status['next_action']}")
+                logger.info(f"[ARUN] Missing steps: {completion_status['missing_steps']}")
+                # Loop continues with updated context
+            elif not is_complete and iteration >= self.max_iterations:
+                logger.warning(f"[ARUN] Max iterations ({self.max_iterations}) reached without completion")
+                break
+
+        # Calculate final metrics
+        metrics.total_iterations = iteration
+        metrics.execution_time_seconds = time.time() - start_time
+        metrics.task_completed = is_complete
+        metrics.iterations_to_completion = iteration if is_complete else None
+
+        # Task completed successfully
+        if is_complete:
+            logger.info(f"[ARUN] Task completed successfully in {iteration} iteration(s)")
+        else:
+            logger.warning(f"[ARUN] Task incomplete after {iteration} iteration(s)")
+
+        final_result = self._format_final_response_with_history(input_text, execution_history, completion_status)
+
+        # Format output according to schema and save to state
+        formatted_result = self._format_output(final_result)
+
+        # Store agent response in memory
+        if self.memory_manager:
+            self.memory_manager.add_memory(
+                content=f"Assistant: {str(formatted_result)[:500]}",  # Limit length
+                metadata={
+                    "role": "assistant",
+                    "type": "output",
+                    "iterations": iteration,
+                    "completed": is_complete
+                },
+                importance=1.0,
+                entry_type="interaction"
+            )
+
+            # Log memory stats
+            mem_stats = self.memory_manager.get_memory_stats()
+            logger.debug(f"[MEMORY] Stats: {mem_stats}")
+
+        # Log final metrics
+        logger.info(f"[METRICS] {metrics.to_dict()}")
+
+        # Return based on return_metrics flag
+        if return_metrics:
+            return AgentResponse(
+                result=formatted_result,
+                metrics=metrics,
+                execution_history=execution_history,
+                completion_status=completion_status
+            )
+        else:
+            return formatted_result
+
     def _reasoning_call(self, input_text: str) -> ReasoningResult:
         """Perform the reasoning phase.
 
@@ -298,7 +819,12 @@ Tool arguments:"""
 
         response = self.llm.invoke(messages)
         logger.debug(f"[REASONING] Raw response: {response.content}")
-        
+
+        # Track metrics
+        if self.current_metrics:
+            self.current_metrics.reasoning_calls += 1
+            self._update_token_usage(response)
+
         try:
             # Parse JSON response
             response_text = response.content
@@ -356,13 +882,28 @@ Tool arguments:"""
         # Execute the tool
         try:
             logger.debug(f"[EXECUTION] Executing tool {task.tool_name} with args: {tool_args}")
+
+            # Track metrics
+            if self.current_metrics:
+                self.current_metrics.tool_executions += 1
+
             result = tool.run(tool_args)
             logger.debug(f"[EXECUTION] Tool result: {result}")
             task.completed = True
             task.result = result
+
+            # Track successful tool call
+            if self.current_metrics:
+                self.current_metrics.successful_tool_calls += 1
+
             return str(result)
         except Exception as e:
             logger.error(f"[EXECUTION] Error executing tool {task.tool_name}: {e}")
+
+            # Track failed tool call
+            if self.current_metrics:
+                self.current_metrics.failed_tool_calls += 1
+
             return f"Error executing tool '{task.tool_name}': {str(e)}"
     
     def _generate_tool_arguments(self, task: TaskExecution, tool: BaseTool, context: str) -> Optional[Dict[str, Any]]:
@@ -401,7 +942,10 @@ Tool arguments:"""
 
         response = self.llm.invoke(messages)
         logger.debug(f"[TOOL_ARGS] Raw response: {response.content}")
-        
+
+        # Track metrics
+        self._update_token_usage(response)
+
         try:
             # Parse JSON arguments
             response_text = response.content
@@ -439,10 +983,143 @@ Tool arguments:"""
 
         response = self.llm.invoke(messages)
         logger.debug(f"[GENERATE] Response: {response.content}")
+
+        # Track metrics
+        self._update_token_usage(response)
+
         return response.content
     
+    def _check_completion(self, original_request: str, execution_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Check if the task has been completed successfully.
+
+        Args:
+            original_request: The original user request
+            execution_history: History of all task executions
+
+        Returns:
+            Dictionary with completion status and details
+        """
+        if not execution_history:
+            return {
+                "is_complete": False,
+                "reasoning": "No tasks have been executed yet",
+                "missing_steps": ["Start executing the planned tasks"],
+                "next_action": "Execute the first task"
+            }
+
+        # Format execution history for the prompt
+        history_text = "\n".join([
+            f"Iteration {item['iteration']}: {item['task']} "
+            f"[Tool: {item['tool'] or 'None'}] -> {item['result'][:300]}... (Status: {item['status']})"
+            for item in execution_history
+        ])
+
+        prompt = self.completion_check_prompt.format(
+            original_request=original_request,
+            execution_history=history_text
+        )
+
+        messages = [
+            SystemMessage(content="You are a task completion validator."),
+            HumanMessage(content=prompt)
+        ]
+
+        logger.debug(f"[COMPLETION_CHECK] Checking completion for: {original_request}")
+        logger.debug(f"[COMPLETION_CHECK] History: {history_text[:500]}")
+
+        response = self.llm.invoke(messages)
+        logger.debug(f"[COMPLETION_CHECK] Raw response: {response.content}")
+
+        # Track metrics
+        if self.current_metrics:
+            self.current_metrics.completion_checks += 1
+            self._update_token_usage(response)
+
+        try:
+            # Parse JSON response
+            response_text = response.content
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                completion_data = json.loads(json_match.group())
+            else:
+                completion_data = json.loads(response_text)
+
+            result = {
+                "is_complete": completion_data.get("is_complete", False),
+                "reasoning": completion_data.get("reasoning", ""),
+                "missing_steps": completion_data.get("missing_steps", []),
+                "next_action": completion_data.get("next_action", "unknown")
+            }
+
+            logger.debug(f"[COMPLETION_CHECK] Parsed result: {result}")
+            return result
+
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"[COMPLETION_CHECK] Error parsing completion check: {e}")
+            # Conservative fallback: assume incomplete
+            return {
+                "is_complete": False,
+                "reasoning": "Failed to parse completion check response",
+                "missing_steps": ["Verify task completion manually"],
+                "next_action": "retry"
+            }
+
+    def _format_final_response_with_history(
+        self,
+        original_request: str,
+        execution_history: List[Dict[str, Any]],
+        completion_status: Dict[str, Any]
+    ) -> str:
+        """Format the final response including execution history.
+
+        Args:
+            original_request: The original user request
+            execution_history: Complete execution history
+            completion_status: Completion check results
+
+        Returns:
+            Formatted final response
+        """
+        logger.debug(f"[FINAL] Formatting response for: {original_request}")
+
+        # Extract all results
+        results = [item["result"] for item in execution_history]
+
+        if len(results) == 1:
+            final_answer = results[0]
+        else:
+            # Combine multiple results with context
+            combined = "\n\n".join([
+                f"Step {i+1} (Iteration {item['iteration']}): {item['task']}\n"
+                f"Tool: {item['tool'] or 'Direct response'}\n"
+                f"Result: {item['result']}"
+                for i, item in enumerate(execution_history)
+            ])
+
+            # Use LLM to create a coherent final response
+            messages = [
+                SystemMessage(content="Summarize the following task execution history into a clear, coherent final answer to the user's original request."),
+                HumanMessage(content=f"Original request: {original_request}\n\nExecution history:\n{combined}\n\nProvide a concise final answer:")
+            ]
+
+            response = self.llm.invoke(messages)
+
+            # Track metrics
+            self._update_token_usage(response)
+
+            final_answer = response.content
+
+        # Add completion status if not complete
+        if not completion_status["is_complete"]:
+            final_answer += f"\n\n⚠️ Note: Task may be incomplete. {completion_status['reasoning']}"
+            if completion_status["missing_steps"]:
+                final_answer += f"\nMissing steps: {', '.join(completion_status['missing_steps'])}"
+
+        logger.debug(f"[FINAL] Final answer: {final_answer[:500]}")
+        return final_answer
+
     def _format_final_response(self, original_request: str, results: List[str]) -> str:
-        """Format the final response from all task results.
+        """Format the final response from all task results (legacy method).
 
         Args:
             original_request: The original user request
@@ -473,7 +1150,244 @@ Tool arguments:"""
 
         response = self.llm.invoke(messages)
         logger.debug(f"[FINAL] Final response: {response.content}")
+
+        # Track metrics
+        self._update_token_usage(response)
+
         return response.content
+
+    # ===== ASYNC VERSIONS OF HELPER METHODS =====
+
+    async def _areasoning_call(self, input_text: str) -> ReasoningResult:
+        """Async version: Perform the reasoning phase.
+
+        Args:
+            input_text: The user's request
+
+        Returns:
+            ReasoningResult containing the analysis and planned tasks
+        """
+        messages = [
+            SystemMessage(content=self.reasoning_prompt),
+            HumanMessage(content=input_text)
+        ]
+
+        logger.debug(f"[ASYNC-REASONING] Input text: {input_text}")
+
+        response = await self.llm.ainvoke(messages)
+        logger.debug(f"[ASYNC-REASONING] Raw response: {response.content}")
+
+        # Track metrics
+        if self.current_metrics:
+            self.current_metrics.reasoning_calls += 1
+            self._update_token_usage(response)
+
+        try:
+            # Parse JSON response
+            response_text = response.content
+            # Extract JSON from the response (in case there's extra text)
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                response_data = json.loads(json_match.group())
+            else:
+                response_data = json.loads(response_text)
+
+            result = ReasoningResult(
+                has_sufficient_info=response_data.get("has_sufficient_info", False),
+                tasks=response_data.get("tasks", []),
+                reasoning=response_data.get("reasoning", "")
+            )
+            logger.debug(f"[ASYNC-REASONING] Parsed result: {result}")
+            return result
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"[ASYNC-REASONING] Error parsing response: {e}")
+            return ReasoningResult(
+                has_sufficient_info=False,
+                tasks=[],
+                reasoning="Failed to parse reasoning response"
+            )
+
+    async def _aexecute_task_with_tool(self, task: TaskExecution, context: str) -> str:
+        """Async version: Execute a task that requires a tool.
+
+        Args:
+            task: The task to execute
+            context: Current context including previous results
+
+        Returns:
+            The result of the tool execution
+        """
+        logger.debug(f"[ASYNC-EXECUTION] Task: {task.description}")
+        logger.debug(f"[ASYNC-EXECUTION] Tool: {task.tool_name}")
+
+        if task.tool_name not in self.tool_map:
+            logger.error(f"[ASYNC-EXECUTION] Tool not found: {task.tool_name}")
+            return f"Error: Tool '{task.tool_name}' not available"
+
+        tool = self.tool_map[task.tool_name]
+
+        # Generate arguments for the tool
+        tool_args = await self._agenerate_tool_arguments(task, tool, context)
+        if tool_args is None:
+            task.completed = False
+            if self.current_metrics:
+                self.current_metrics.failed_tool_calls += 1
+            return f"Error: Could not generate valid arguments for tool '{task.tool_name}'"
+
+        # Execute the tool
+        try:
+            logger.info(f"[ASYNC-EXECUTION] Executing {task.tool_name} with args: {tool_args}")
+
+            # Run tool in thread pool since most tools are sync
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, tool.run, tool_args)
+
+            logger.info(f"[ASYNC-EXECUTION] Tool result: {result}")
+            task.completed = True
+            task.result = result
+
+            # Track metrics
+            if self.current_metrics:
+                self.current_metrics.tool_executions += 1
+                self.current_metrics.successful_tool_calls += 1
+
+            return str(result)
+        except Exception as e:
+            logger.error(f"[ASYNC-EXECUTION] Tool execution failed: {e}")
+            task.completed = False
+            if self.current_metrics:
+                self.current_metrics.tool_executions += 1
+                self.current_metrics.failed_tool_calls += 1
+            return f"Error executing tool: {str(e)}"
+
+    async def _agenerate_tool_arguments(self, task: TaskExecution, tool: BaseTool, context: str) -> Optional[Dict[str, Any]]:
+        """Async version: Generate arguments for a tool call.
+
+        Args:
+            task: The task requiring tool execution
+            tool: The tool to use
+            context: Current context
+
+        Returns:
+            Dictionary of tool arguments or None if generation failed
+        """
+        # Get tool schema
+        tool_schema = tool.args_schema.schema() if hasattr(tool, 'args_schema') and tool.args_schema else {}
+
+        prompt = self.execution_prompt.format(
+            tool_name=tool.name,
+            tool_description=tool.description,
+            tool_parameters=json.dumps(tool_schema, indent=2),
+            task_description=task.description,
+            context=context
+        )
+
+        messages = [
+            SystemMessage(content=prompt),
+            HumanMessage(content=f"Generate the arguments for this tool call.")
+        ]
+
+        logger.debug(f"[ASYNC-TOOL-ARGS] Generating args for {tool.name}")
+
+        response = await self.llm.ainvoke(messages)
+
+        # Track metrics
+        self._update_token_usage(response)
+
+        try:
+            # Extract JSON from response
+            response_text = response.content
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                args = json.loads(json_match.group())
+            else:
+                args = json.loads(response_text)
+
+            logger.debug(f"[ASYNC-TOOL-ARGS] Generated args: {args}")
+            return args
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"[ASYNC-TOOL-ARGS] Error parsing arguments: {e}")
+            logger.debug(f"[ASYNC-TOOL-ARGS] Failed to parse: {response.content}")
+            return None
+
+    async def _agenerate_response(self, task_description: str, context: str) -> str:
+        """Async version: Generate a direct response without using tools.
+
+        Args:
+            task_description: Description of the task
+            context: Current context
+
+        Returns:
+            Generated response
+        """
+        messages = [
+            SystemMessage(content="You are a helpful AI assistant. Provide a clear and concise response to the task."),
+            HumanMessage(content=f"Context: {context}\n\nTask: {task_description}\n\nYour response:")
+        ]
+
+        logger.debug(f"[ASYNC-RESPONSE] Generating response for: {task_description}")
+
+        response = await self.llm.ainvoke(messages)
+
+        # Track metrics
+        self._update_token_usage(response)
+
+        logger.debug(f"[ASYNC-RESPONSE] Generated: {response.content}")
+        return response.content
+
+    async def _acheck_completion(self, original_request: str, execution_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Async version: Check if the task has been completed.
+
+        Args:
+            original_request: The original user request
+            execution_history: History of task executions
+
+        Returns:
+            Dictionary with completion status and reasoning
+        """
+        history_summary = "\n".join([
+            f"- {item['task']}: {item['result'][:200]}"
+            for item in execution_history
+        ])
+
+        prompt = self.completion_check_prompt.format(
+            original_request=original_request,
+            execution_history=history_summary
+        )
+
+        messages = [
+            SystemMessage(content=self.completion_check_prompt),
+            HumanMessage(content=f"Original request: {original_request}\n\nExecution history:\n{history_summary}\n\nIs the task complete?")
+        ]
+
+        logger.debug(f"[ASYNC-COMPLETION] Checking completion for: {original_request}")
+
+        response = await self.llm.ainvoke(messages)
+
+        # Track metrics
+        if self.current_metrics:
+            self.current_metrics.completion_checks += 1
+        self._update_token_usage(response)
+
+        try:
+            response_text = response.content
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                completion_status = json.loads(json_match.group())
+            else:
+                completion_status = json.loads(response_text)
+
+            logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
+            return completion_status
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
+            # Default to continuing if we can't parse
+            return {
+                "is_complete": False,
+                "reasoning": "Failed to parse completion check",
+                "next_action": "Continue with next iteration",
+                "missing_steps": []
+            }
 
 
 # Example usage function
@@ -485,7 +1399,13 @@ def create_gemma_agent(
     input_schema: Optional[Type[BaseModel]] = None,
     output_schema: Optional[Type[BaseModel]] = None,
     output_key: Optional[str] = None,
-    state: Optional[Dict[str, Any]] = None
+    state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+    max_iterations: int = 10,
+    enable_memory: bool = False,
+    memory_backend: str = "in_memory",
+    max_context_tokens: int = 4096,
+    memory_context_ratio: float = 0.3,
+    max_memory_size: Optional[int] = 100
 ) -> ReasoningAgent:
     """Create a ReasoningAgent configured for Gemma3:27b.
 
@@ -497,7 +1417,13 @@ def create_gemma_agent(
         input_schema: Optional Pydantic BaseModel for structured input validation
         output_schema: Optional Pydantic BaseModel for structured output
         output_key: Optional key to save output in shared state
-        state: Optional shared state dictionary between agents
+        state: Optional shared state (dict or SharedState from graph module)
+        max_iterations: Maximum number of reasoning-execution loops (default: 10)
+        enable_memory: Whether to enable memory management
+        memory_backend: Type of memory backend ("in_memory" or "vector_store")
+        max_context_tokens: Maximum tokens for context window
+        memory_context_ratio: Ratio of context to use for memory (0.0 to 1.0)
+        max_memory_size: Maximum number of memories to keep (None for unlimited)
 
     Returns:
         Configured ReasoningAgent instance
@@ -513,6 +1439,20 @@ def create_gemma_agent(
     if tools is None:
         tools = []
 
+    # Create memory manager if enabled
+    memory_manager = None
+    if enable_memory and MEMORY_AVAILABLE:
+        memory_manager = create_memory_manager(
+            backend_type=memory_backend,
+            max_context_tokens=max_context_tokens,
+            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            llm=llm,
+            max_size=max_memory_size
+        )
+        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend")
+    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.warning("[MEMORY] Memory requested but module not available")
+
     return ReasoningAgent(
         llm=llm,
         tools=tools,
@@ -520,5 +1460,8 @@ def create_gemma_agent(
         input_schema=input_schema,
         output_schema=output_schema,
         output_key=output_key,
-        state=state
+        state=state,
+        max_iterations=max_iterations,
+        memory_manager=memory_manager,
+        memory_context_ratio=memory_context_ratio
     )
