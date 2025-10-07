@@ -1,0 +1,419 @@
+"""FastAPI application to test the ReasoningAgent with Gemma3:27b."""
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+import json
+import asyncio
+from datetime import datetime
+from loguru import logger
+
+from linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
+from linus.agents.agent.tools import get_default_tools, create_custom_tool
+
+
+class Settings(BaseSettings):
+    """Application settings."""
+    
+    app_name: str = "ReasoningAgent API"
+    app_version: str = "1.0.0"
+    
+    # Gemma/Ollama configuration
+    llm_api_base: str = "http://localhost:11434/v1"
+    llm_model: str = "gemma3:27b"
+    llm_temperature: float = 0.7
+    
+    # Agent configuration
+    agent_verbose: bool = True
+    agent_timeout: int = 300  # 5 minutes timeout
+    
+    # API configuration
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+settings = Settings()
+
+# Global agent instance
+agent: Optional[ReasoningAgent] = None
+
+# Store conversation history
+conversation_history: List[Dict[str, Any]] = []
+
+
+class AgentRequest(BaseModel):
+    """Request model for agent interactions."""
+    
+    query: str = Field(..., description="The user's query or task for the agent")
+    use_tools: bool = Field(default=True, description="Whether to use tools")
+    stream: bool = Field(default=False, description="Whether to stream the response")
+    session_id: Optional[str] = Field(default=None, description="Session ID for context")
+
+
+class AgentResponse(BaseModel):
+    """Response model for agent interactions."""
+    
+    query: str
+    response: str
+    reasoning: Optional[Dict[str, Any]] = None
+    tools_used: List[str] = []
+    execution_time: float
+    timestamp: str
+    session_id: Optional[str] = None
+
+
+class ToolTestRequest(BaseModel):
+    """Request model for testing individual tools."""
+    
+    tool_name: str = Field(..., description="Name of the tool to test")
+    tool_args: Dict[str, Any] = Field(..., description="Arguments for the tool")
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    
+    status: str
+    agent_ready: bool
+    model: str
+    available_tools: List[str]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    global agent
+    
+    # Startup
+    logger.info("Starting ReasoningAgent API...")
+    
+    try:
+        # Initialize the agent
+        tools = get_default_tools()
+        
+        # Add some custom tools for testing
+        def get_time() -> str:
+            """Get the current time."""
+            return f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        time_tool = create_custom_tool(
+            name="get_time",
+            description="Get the current date and time",
+            func=get_time
+        )
+        tools.append(time_tool)
+        
+        agent = create_gemma_agent(
+            api_base=settings.llm_api_base,
+            model=settings.llm_model,
+            tools=tools,
+            verbose=settings.agent_verbose
+        )
+        
+        logger.info(f"Agent initialized with {len(tools)} tools")
+        logger.info(f"Using model: {settings.llm_model} at {settings.llm_api_base}")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize agent: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down ReasoningAgent API...")
+    conversation_history.clear()
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    lifespan=lifespan
+)
+
+
+@app.get("/", response_model=Dict[str, str])
+async def root():
+    """Root endpoint."""
+    return {
+        "name": settings.app_name,
+        "version": settings.app_version,
+        "status": "running"
+    }
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Check the health status of the application."""
+    global agent
+    
+    available_tools = []
+    if agent:
+        available_tools = [tool.name for tool in agent.tools]
+    
+    return HealthResponse(
+        status="healthy" if agent else "unhealthy",
+        agent_ready=agent is not None,
+        model=settings.llm_model,
+        available_tools=available_tools
+    )
+
+
+@app.post("/agent/query", response_model=AgentResponse)
+async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
+    """Send a query to the agent and get a response."""
+    global agent, conversation_history
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    start_time = datetime.now()
+    
+    try:
+        # Run the agent (this is synchronous, so we run it in a thread pool)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, agent.run, request.query)
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        # Extract reasoning information if available
+        reasoning = None
+        if hasattr(agent, '_last_reasoning_result'):
+            reasoning = {
+                "has_sufficient_info": agent._last_reasoning_result.has_sufficient_info,
+                "reasoning": agent._last_reasoning_result.reasoning,
+                "tasks": agent._last_reasoning_result.tasks
+            }
+        
+        # Track which tools were used
+        tools_used = []
+        if reasoning and reasoning.get("tasks"):
+            tools_used = [
+                task.get("tool_name") 
+                for task in reasoning["tasks"] 
+                if task.get("tool_name")
+            ]
+        
+        response = AgentResponse(
+            query=request.query,
+            response=result,
+            reasoning=reasoning,
+            tools_used=tools_used,
+            execution_time=execution_time,
+            timestamp=datetime.now().isoformat(),
+            session_id=request.session_id
+        )
+        
+        # Store in conversation history
+        conversation_history.append(response.dict())
+        
+        # Limit history size
+        if len(conversation_history) > 100:
+            conversation_history = conversation_history[-100:]
+        
+        return response
+        
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=408,
+            detail=f"Agent query timed out after {settings.agent_timeout} seconds"
+        )
+    except Exception as e:
+        logger.error(f"Error processing query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agent/reasoning")
+async def test_reasoning(request: AgentRequest):
+    """Test only the reasoning phase without execution."""
+    global agent
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    try:
+        # Run reasoning phase only
+        loop = asyncio.get_event_loop()
+        reasoning_result = await loop.run_in_executor(
+            None, 
+            agent._reasoning_call, 
+            request.query
+        )
+        
+        return {
+            "query": request.query,
+            "has_sufficient_info": reasoning_result.has_sufficient_info,
+            "reasoning": reasoning_result.reasoning,
+            "planned_tasks": reasoning_result.tasks
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in reasoning phase: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/test")
+async def test_tool(request: ToolTestRequest):
+    """Test a specific tool with given arguments."""
+    global agent
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    if request.tool_name not in agent.tool_map:
+        available = list(agent.tool_map.keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{request.tool_name}' not found. Available tools: {available}"
+        )
+    
+    try:
+        tool = agent.tool_map[request.tool_name]
+        
+        # Execute the tool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            tool.run,
+            request.tool_args
+        )
+        
+        return {
+            "tool": request.tool_name,
+            "args": request.tool_args,
+            "result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error executing tool {request.tool_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tools")
+async def list_tools():
+    """List all available tools."""
+    global agent
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    tools_info = []
+    for tool in agent.tools:
+        tool_info = {
+            "name": tool.name,
+            "description": tool.description
+        }
+        
+        # Add schema if available
+        if hasattr(tool, 'args_schema') and tool.args_schema:
+            tool_info["schema"] = tool.args_schema.schema()
+        
+        tools_info.append(tool_info)
+    
+    return {"tools": tools_info}
+
+
+@app.get("/history")
+async def get_history(limit: int = 10, session_id: Optional[str] = None):
+    """Get conversation history."""
+    history = conversation_history
+    
+    if session_id:
+        history = [h for h in history if h.get("session_id") == session_id]
+    
+    # Return most recent items
+    return {"history": history[-limit:], "total": len(history)}
+
+
+@app.delete("/history")
+async def clear_history():
+    """Clear conversation history."""
+    global conversation_history
+    count = len(conversation_history)
+    conversation_history.clear()
+    return {"message": f"Cleared {count} conversation entries"}
+
+
+@app.post("/agent/batch")
+async def batch_queries(queries: List[str]):
+    """Process multiple queries in batch."""
+    global agent
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    results = []
+    
+    for query in queries:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, agent.run, query)
+            results.append({
+                "query": query,
+                "response": result,
+                "status": "success"
+            })
+        except Exception as e:
+            results.append({
+                "query": query,
+                "error": str(e),
+                "status": "failed"
+            })
+    
+    return {"results": results}
+
+
+# Example endpoint for testing specific scenarios
+@app.get("/test/scenarios")
+async def test_scenarios():
+    """Run predefined test scenarios."""
+    global agent
+    
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    scenarios = [
+        "What is the current time?",
+        "Calculate 42 * 17 + 256",
+        "Search for information about FastAPI",
+        "First get the current time, then calculate 100/4, and finally search for Python"
+    ]
+    
+    results = []
+    for scenario in scenarios:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, agent.run, scenario)
+            results.append({
+                "scenario": scenario,
+                "result": result[:200] + "..." if len(result) > 200 else result
+            })
+        except Exception as e:
+            results.append({
+                "scenario": scenario,
+                "error": str(e)
+            })
+    
+    return {"test_results": results}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+
+    # Create logs directory if it doesn't exist
+    os.makedirs("logs", exist_ok=True)
+
+    logger.add("logs/agent_api.log", rotation="10 MB")
+
+    uvicorn.run(
+        "app:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=True
+    )

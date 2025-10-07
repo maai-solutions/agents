@@ -1,0 +1,16 @@
+pydantic
+python-dotenv
+loguru
+
+fastapi
+uvicorn
+
+openai
+langchain
+langchain-core
+langchain-community
+langgraph
+
+pydantic-settings
+
+requests
