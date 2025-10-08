@@ -11,6 +11,7 @@ A complete framework for building sophisticated AI agent systems with memory, me
 - ✅ **Memory Management** - Persistent context with automatic token management and summarization
 - ✅ **Tool Integration** - Extensible tool system with built-in and custom tools
 - ✅ **Structured I/O** - Optional Pydantic schemas for input validation and output structure
+- ✅ **OpenTelemetry Tracing** - Production-ready distributed tracing for debugging and monitoring
 
 ### DAG Orchestration
 - ✅ **Multi-Agent Workflows** - Coordinate multiple agents in complex DAGs
@@ -135,6 +136,8 @@ print(f"Report: {result.final_state['final_report']}")
 - **[METRICS.md](METRICS.md)** - Metrics tracking
 - **[DAG.md](DAG.md)** - DAG orchestration guide
 - **[LOGGING.md](LOGGING.md)** - Logging configuration
+- **[TELEMETRY.md](TELEMETRY.md)** - OpenTelemetry tracing guide
+- **[MCP_INTEGRATION.md](MCP_INTEGRATION.md)** - Model Context Protocol integration
 
 ## 🧪 Testing
 

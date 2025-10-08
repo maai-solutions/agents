@@ -14,6 +14,7 @@ from datetime import datetime
 from loguru import logger
 
 from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_tools, create_custom_tool
+from linus.agents.telemetry import initialize_telemetry, is_telemetry_available
 
 
 # Configure logging early
@@ -50,7 +51,13 @@ class Settings(BaseSettings):
     # Agent configuration
     agent_verbose: bool = True
     agent_timeout: int = 300  # 5 minutes timeout
-    
+
+    # Telemetry configuration
+    telemetry_enabled: bool = False
+    telemetry_exporter: str = "console"  # console, otlp, jaeger
+    telemetry_otlp_endpoint: str = "http://localhost:4317"
+    telemetry_jaeger_endpoint: str = "localhost"
+
     # API configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -111,10 +118,24 @@ class HealthResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     global agent
-    
+
     # Startup
     logger.info("Starting ReasoningAgent API...")
-    
+
+    # Initialize telemetry if enabled
+    if settings.telemetry_enabled and is_telemetry_available():
+        logger.info("[TELEMETRY] Initializing OpenTelemetry tracing...")
+        initialize_telemetry(
+            service_name="reasoning-agent-api",
+            exporter_type=settings.telemetry_exporter,
+            otlp_endpoint=settings.telemetry_otlp_endpoint,
+            jaeger_endpoint=settings.telemetry_jaeger_endpoint,
+            enabled=True
+        )
+        logger.info(f"[TELEMETRY] Tracing enabled with {settings.telemetry_exporter} exporter")
+    elif settings.telemetry_enabled and not is_telemetry_available():
+        logger.warning("[TELEMETRY] Telemetry requested but OpenTelemetry not installed")
+
     try:
         # Initialize the agent
         tools = get_default_tools()

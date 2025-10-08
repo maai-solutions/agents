@@ -13,6 +13,7 @@ from .base import Agent
 from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse
 from .tool_base import BaseTool
 from ..graph.state import SharedState
+from ..telemetry import get_tracer, AgentTracer, trace_method
 
 
 class ReasoningAgent(Agent):
@@ -72,6 +73,9 @@ class ReasoningAgent(Agent):
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.top_k = top_k
+
+        # Telemetry tracer
+        self.tracer = get_tracer()
 
     def _get_generation_kwargs(self) -> Dict[str, Any]:
         """Build kwargs for LLM generation with configured parameters.
@@ -525,6 +529,7 @@ Response:"""
         else:
             return formatted_result
 
+    @trace_method("agent.reasoning")
     def _reasoning_call(self, input_text: str) -> ReasoningResult:
         """Perform the reasoning phase.
 
@@ -543,12 +548,19 @@ Response:"""
         logger.debug(f"[REASONING] System prompt: {self.reasoning_prompt}")
         logger.debug(f"[REASONING] Messages: {messages}")
 
+        # Add telemetry for LLM call
+        self.tracer.set_attribute("llm.input", input_text[:500])
+        self.tracer.set_attribute("llm.model", self.model)
+
         response = self.llm.chat.completions.create(
             messages=messages,
             **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[REASONING] Raw response: {response_text}")
+
+        # Record LLM output
+        self.tracer.set_attribute("llm.output", response_text[:500])
 
         # Track metrics
         if self.current_metrics:
@@ -581,6 +593,7 @@ Response:"""
                 reasoning="Failed to parse reasoning response"
             )
     
+    @trace_method("agent.execute_task")
     def _execute_task_with_tool(self, task: TaskExecution, context: str) -> str:
         """Execute a task that requires a tool.
 
@@ -595,22 +608,31 @@ Response:"""
         logger.debug(f"[EXECUTION] Tool: {task.tool_name}")
         logger.debug(f"[EXECUTION] Context: {context}")
 
+        # Add telemetry
+        self.tracer.set_attribute("task.description", task.description)
+        self.tracer.set_attribute("task.tool_name", task.tool_name or "none")
+
         if task.tool_name not in self.tool_map:
             logger.error(f"[EXECUTION] Tool '{task.tool_name}' not found in tool_map")
+            self.tracer.add_event("tool_not_found", {"tool_name": task.tool_name})
             return f"Error: Tool '{task.tool_name}' not found"
 
         tool = self.tool_map[task.tool_name]
 
         # Generate tool arguments
         tool_args = self._generate_tool_arguments(task, tool, context)
-        
+
         if tool_args is None:
             logger.error(f"[EXECUTION] Failed to generate arguments for tool '{task.tool_name}'")
+            self.tracer.add_event("tool_args_generation_failed", {"tool_name": task.tool_name})
             return f"Error: Failed to generate arguments for tool '{task.tool_name}'"
 
         # Execute the tool
         try:
             logger.debug(f"[EXECUTION] Executing tool {task.tool_name} with args: {tool_args}")
+
+            # Add telemetry for tool execution
+            self.tracer.set_attribute("tool.args", str(tool_args)[:500])
 
             # Track metrics
             if self.current_metrics:
@@ -618,6 +640,9 @@ Response:"""
 
             result = tool.run(tool_args)
             logger.debug(f"[EXECUTION] Tool result: {result}")
+
+            # Add telemetry for tool result
+            self.tracer.set_attribute("tool.result", str(result)[:500])
             task.completed = True
             task.result = result
 
