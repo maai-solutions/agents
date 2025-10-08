@@ -46,6 +46,11 @@ python example_usage.py --test-reasoning
 python test_api.py
 ```
 
+**Test rich logging features:**
+```bash
+python example_rich_logging.py
+```
+
 ### Configuration
 Environment variables are configured in `.env`:
 - `LLM_API_BASE`: OpenAI-compatible API endpoint (default: `http://localhost:11434/v1`)
@@ -80,6 +85,15 @@ Environment variables are configured in `.env`:
 - `APIRequestTool`: HTTP API requests
 - `get_default_tools()`: Returns list of available tools
 - `create_custom_tool()`: Utility to create custom tools from functions
+
+**Logging** (`src/linus/agents/logging_config.py`):
+- `setup_rich_logging()`: Configure rich logging with beautiful console output
+- `log_with_panel()`: Display messages in bordered panels
+- `log_with_table()`: Display data in formatted tables
+- `log_metrics()`: Display metrics in a table format
+- `log_tree()`: Display nested data as a tree structure
+- Rich integration provides colored output, syntax highlighting, and enhanced tracebacks
+- See [docs/RICH_LOGGING.md](docs/RICH_LOGGING.md) for detailed guide
 
 **FastAPI Application** (`src/app.py`):
 - `/agent/query`: Main endpoint for agent queries

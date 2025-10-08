@@ -2,7 +2,24 @@
 
 ## Overview
 
-The agent system uses [Loguru](https://github.com/Delgan/loguru) for comprehensive logging with automatic rotation, retention, and multiple output formats.
+The agent system uses [Loguru](https://github.com/Delgan/loguru) for comprehensive logging with automatic rotation, retention, and multiple output formats. The framework now supports [Rich](https://rich.readthedocs.io/) for enhanced console output with colors, tables, panels, and beautiful formatting.
+
+## 🎨 Rich Logging (New!)
+
+For enhanced visual logging with colors, tables, and formatted output, see:
+- **[Rich Logging Guide](RICH_LOGGING.md)** - Complete guide to Rich features
+- **[Logging Comparison](LOGGING_COMPARISON.md)** - Before/After examples
+
+### Quick Start with Rich
+
+```python
+from linus.agents.logging_config import setup_rich_logging
+
+# Setup rich logging with beautiful output
+console = setup_rich_logging(level="INFO", log_file="logs/app.log")
+```
+
+## Standard Logging (Classic)
 
 ## Configuration
 

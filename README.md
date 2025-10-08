@@ -12,6 +12,7 @@ A complete framework for building sophisticated AI agent systems with memory, me
 - ✅ **Tool Integration** - Extensible tool system with built-in and custom tools
 - ✅ **Structured I/O** - Optional Pydantic schemas for input validation and output structure
 - ✅ **OpenTelemetry Tracing** - Production-ready distributed tracing for debugging and monitoring
+- ✅ **Rich Logging** - Beautiful console output with colors, tables, panels, and enhanced tracebacks
 
 ### DAG Orchestration
 - ✅ **Multi-Agent Workflows** - Coordinate multiple agents in complex DAGs
@@ -152,13 +153,37 @@ python tests/test_dag.py
 python examples/dag_example.py
 ```
 
+## 🎨 Rich Logging
+
+Beautiful console output with colors, tables, and formatting:
+
+```python
+from linus.agents.logging_config import setup_rich_logging, log_metrics
+
+# Setup rich logging
+console = setup_rich_logging(level="INFO", log_file="logs/app.log")
+
+# Metrics displayed in beautiful tables
+metrics = {
+    "total_tokens": 1245,
+    "execution_time": 2.34,
+    "success_rate": 0.95
+}
+log_metrics(metrics, title="Agent Metrics")
+```
+
+**Try it:** `python test_rich_quick.py`
+
+**Documentation:** [docs/RICH_LOGGING.md](docs/RICH_LOGGING.md)
+
 ## 📁 Project Structure
 
 ```
 agents/
 ├── src/linus/agents/
 │   ├── agent/          # Core agent system
-│   └── graph/          # DAG orchestration
+│   ├── graph/          # DAG orchestration
+│   └── logging_config.py  # Rich logging utilities
 ├── tests/              # Test suites
 ├── examples/           # Usage examples
 └── docs/              # Documentation

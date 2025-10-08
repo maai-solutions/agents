@@ -15,6 +15,18 @@ from .tool_base import BaseTool
 from ..graph.state import SharedState
 from ..telemetry import get_tracer, AgentTracer, trace_method
 
+# Try to import rich for enhanced logging
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import track
+    RICH_AVAILABLE = True
+    _console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    _console = None
+
 
 class ReasoningAgent(Agent):
     """Agent that uses two-call approach for Gemma3:27b without tool support.
@@ -336,8 +348,11 @@ Response:"""
             mem_stats = self.memory_manager.get_memory_stats()
             logger.debug(f"[MEMORY] Stats: {mem_stats}")
 
-        # Log final metrics
-        logger.info(f"[METRICS] {metrics.to_dict()}")
+        # Log final metrics with rich formatting if available
+        if RICH_AVAILABLE and _console:
+            self._display_metrics_rich(metrics)
+        else:
+            logger.info(f"[METRICS] {metrics.to_dict()}")
 
         # Return based on return_metrics flag
         if return_metrics:
@@ -515,8 +530,11 @@ Response:"""
             mem_stats = self.memory_manager.get_memory_stats()
             logger.debug(f"[MEMORY] Stats: {mem_stats}")
 
-        # Log final metrics
-        logger.info(f"[METRICS] {metrics.to_dict()}")
+        # Log final metrics with rich formatting if available
+        if RICH_AVAILABLE and _console:
+            self._display_metrics_rich(metrics)
+        else:
+            logger.info(f"[METRICS] {metrics.to_dict()}")
 
         # Return based on return_metrics flag
         if return_metrics:
@@ -1177,5 +1195,59 @@ Response:"""
                 "next_action": "Continue with next iteration",
                 "missing_steps": []
             }
+
+    def _display_metrics_rich(self, metrics: AgentMetrics):
+        """Display metrics using rich formatting.
+
+        Args:
+            metrics: AgentMetrics instance to display
+        """
+        if not RICH_AVAILABLE or not _console:
+            return
+
+        # Create metrics table
+        table = Table(title="🤖 Agent Execution Metrics", show_header=True, header_style="bold magenta")
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Value", style="green")
+
+        metrics_data = metrics.to_dict()
+
+        # Format metrics for display
+        formatted_metrics = {
+            "Total Iterations": metrics_data.get("total_iterations", 0),
+            "Total Tokens": f"{metrics_data.get('total_tokens', 0):,}",
+            "Execution Time": f"{metrics_data.get('execution_time_seconds', 0):.2f}s",
+            "LLM Calls": metrics_data.get("llm_calls", 0),
+            "Tool Executions": metrics_data.get("tool_executions", 0),
+            "Successful Tools": metrics_data.get("successful_tool_calls", 0),
+            "Failed Tools": metrics_data.get("failed_tool_calls", 0),
+            "Task Completed": "✅ Yes" if metrics_data.get("task_completed") else "❌ No",
+            "Avg Tokens/Call": f"{metrics_data.get('avg_tokens_per_llm_call', 0):.1f}",
+            "Success Rate": f"{metrics_data.get('success_rate', 0):.1%}"
+        }
+
+        for key, value in formatted_metrics.items():
+            table.add_row(key, str(value))
+
+        _console.print(table)
+
+    def _display_reasoning_rich(self, reasoning: ReasoningResult):
+        """Display reasoning results using rich formatting.
+
+        Args:
+            reasoning: ReasoningResult to display
+        """
+        if not RICH_AVAILABLE or not _console:
+            return
+
+        # Create panel for reasoning
+        panel_content = f"[yellow]{reasoning.reasoning}[/yellow]\n\n"
+        panel_content += "[bold cyan]Planned Tasks:[/bold cyan]\n"
+
+        for i, task in enumerate(reasoning.tasks, 1):
+            tool_name = task.get("tool_name", "None")
+            panel_content += f"  {i}. {task['description']} [dim](Tool: {tool_name})[/dim]\n"
+
+        _console.print(Panel(panel_content, title="🧠 Reasoning Phase", border_style="blue"))
 
 

@@ -17,16 +17,32 @@ from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_t
 from linus.agents.telemetry import initialize_telemetry, is_telemetry_available
 
 
-# Configure logging early
+# Configure logging early with rich support
 os.makedirs("logs", exist_ok=True)
 
-# Remove default handler and add custom ones
+# Rich console handler for beautiful terminal output
+from rich.console import Console
+from rich.logging import RichHandler
+
+console = Console()
+
+# Remove default handler and add rich console handler
 logger.remove()
 logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+    RichHandler(
+        console=console,
+        rich_tracebacks=True,
+        tracebacks_show_locals=True,
+        markup=True,
+        show_time=True,
+        show_level=True,
+        show_path=True
+    ),
+    format="{message}",
     level="INFO"
 )
+
+# File handler for detailed logs
 logger.add(
     "logs/agent_api.log",
     rotation="10 MB",
