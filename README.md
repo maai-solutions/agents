@@ -32,21 +32,34 @@ cd agents
 pip install -r requirements.txt
 
 # Or install specific packages
-pip install langchain langchain-core langchain-community \
-    pydantic loguru tiktoken fastapi uvicorn
+pip install openai pydantic loguru tiktoken fastapi uvicorn langchain-core
 ```
+
+## 🔧 Prerequisites
+
+- **Local LLM (Ollama)**: Install [Ollama](https://ollama.ai) and pull a model:
+  ```bash
+  ollama pull gemma3:27b
+  ```
+- **OpenAI API**: Get an API key from [OpenAI](https://platform.openai.com/api-keys)
 
 ## 🚀 Quick Start
 
-### Single Agent
+### Single Agent (Ollama)
 
 ```python
 from linus.agents.agent.agent import create_gemma_agent
 from linus.agents.agent.tools import get_default_tools
 
-# Create agent
+# Create agent with Ollama
 tools = get_default_tools()
 agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
+    max_tokens=2048,
+    top_k=40,
     tools=tools,
     enable_memory=True,
     max_context_tokens=4096
@@ -59,6 +72,25 @@ print(f"Result: {response.result}")
 print(f"Iterations: {response.metrics.total_iterations}")
 print(f"Tokens: {response.metrics.total_tokens}")
 print(f"Time: {response.metrics.execution_time_seconds}s")
+```
+
+### Single Agent (OpenAI)
+
+```python
+# Create agent with OpenAI
+agent = create_gemma_agent(
+    api_base="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="sk-your-api-key-here",
+    temperature=0.5,
+    max_tokens=1000,
+    top_p=0.9,
+    tools=get_default_tools()
+)
+
+# Use async version
+response = await agent.arun("What is the weather today?")
+print(response.result)
 ```
 
 ### Multi-Agent DAG

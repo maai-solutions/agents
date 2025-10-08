@@ -19,25 +19,39 @@ Complete API documentation for creating and using agents with tools, memory, and
 
 ## Quick Start
 
-### Basic Agent
+### Basic Agent (Ollama)
 
 ```python
 from linus.agents.agent.agent import create_gemma_agent
 from linus.agents.agent.tools import get_default_tools
 
-# Create agent
+# Create agent with Ollama
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools)
+agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
+    max_tokens=2048,
+    top_k=40,
+    tools=tools
+)
 
 # Run task
 result = agent.run("Calculate 42 * 17")
 print(result)
 ```
 
-### With Memory and Metrics
+### With OpenAI
 
 ```python
 agent = create_gemma_agent(
+    api_base="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="sk-your-api-key",
+    temperature=0.5,
+    max_tokens=1000,
+    top_p=0.9,
     tools=tools,
     enable_memory=True,
     max_context_tokens=4096
@@ -54,31 +68,33 @@ print(f"Metrics: {response.metrics.to_dict()}")
 
 ### Agent
 
-Base class for all agents.
+Base class for all agents. Uses OpenAI client (sync or async).
 
 ```python
 class Agent:
     def __init__(
         self,
-        llm: ChatOpenAI,
+        llm: Union[OpenAI, AsyncOpenAI],
+        model: str,
         tools: List[BaseTool],
         verbose: bool = False,
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Dict[str, Any]] = None,
+        state: Optional[SharedState] = None,
         memory_manager: Optional[MemoryManager] = None
     )
 ```
 
 **Parameters:**
-- `llm` (ChatOpenAI): Language model instance
+- `llm` (Union[OpenAI, AsyncOpenAI]): OpenAI client instance
+- `model` (str): Model name (e.g., "gemma3:27b", "gpt-4")
 - `tools` (List[BaseTool]): Available tools for the agent
 - `verbose` (bool): Enable debug logging (default: False)
 - `input_schema` (Optional[Type[BaseModel]]): Pydantic model for input validation
 - `output_schema` (Optional[Type[BaseModel]]): Pydantic model for output structure
 - `output_key` (Optional[str]): Key to save output in shared state
-- `state` (Optional[Union[Dict[str, Any], SharedState]]): State storage (dict or SharedState)
+- `state` (Optional[SharedState]): SharedState instance for state management
 - `memory_manager` (Optional[MemoryManager]): Memory manager instance
 
 **Methods:**
@@ -102,22 +118,31 @@ Advanced agent with iterative reasoning-execution loop.
 class ReasoningAgent(Agent):
     def __init__(
         self,
-        llm: ChatOpenAI,
+        llm: Union[OpenAI, AsyncOpenAI],
+        model: str,
         tools: List[BaseTool],
         verbose: bool = False,
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Dict[str, Any]] = None,
+        state: Optional[SharedState] = None,
         max_iterations: int = 10,
         memory_manager: Optional[MemoryManager] = None,
-        memory_context_ratio: float = 0.3
+        memory_context_ratio: float = 0.3,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     )
 ```
 
 **Additional Parameters:**
 - `max_iterations` (int): Maximum reasoning-execution loops (default: 10)
 - `memory_context_ratio` (float): Ratio of context for memory 0.0-1.0 (default: 0.3)
+- `temperature` (float): Sampling temperature 0.0-2.0 (default: 0.7)
+- `max_tokens` (Optional[int]): Maximum tokens to generate
+- `top_p` (Optional[float]): Nucleus sampling 0.0-1.0
+- `top_k` (Optional[int]): Top-k sampling (Ollama-specific)
 
 **Methods:**
 
@@ -144,10 +169,17 @@ def run(
 
 ```python
 from linus.agents.agent.agent import ReasoningAgent
-from langchain_community.chat_models import ChatOpenAI
+from openai import OpenAI
 
-llm = ChatOpenAI(base_url="http://localhost:11434/v1", model="gemma3:27b")
-agent = ReasoningAgent(llm=llm, tools=tools, max_iterations=10)
+llm = OpenAI(base_url="http://localhost:11434/v1", api_key="not-needed")
+agent = ReasoningAgent(
+    llm=llm,
+    model="gemma3:27b",
+    tools=tools,
+    max_iterations=10,
+    temperature=0.7,
+    max_tokens=2048
+)
 
 # Simple result
 result = agent.run("Calculate 10 + 5", return_metrics=False)
@@ -162,24 +194,30 @@ response = agent.run("Calculate 10 + 5", return_metrics=True)
 
 ### create_gemma_agent()
 
-Factory function to create a pre-configured ReasoningAgent for Gemma models.
+Factory function to create a pre-configured ReasoningAgent for OpenAI-compatible APIs.
 
 ```python
 def create_gemma_agent(
     api_base: str = "http://localhost:11434/v1",
     model: str = "gemma3:27b",
+    api_key: str = "not-needed",
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
     input_schema: Optional[Type[BaseModel]] = None,
     output_schema: Optional[Type[BaseModel]] = None,
     output_key: Optional[str] = None,
-    state: Optional[Dict[str, Any]] = None,
+    state: Optional[SharedState] = None,
     max_iterations: int = 10,
     enable_memory: bool = False,
     memory_backend: str = "in_memory",
     max_context_tokens: int = 4096,
     memory_context_ratio: float = 0.3,
-    max_memory_size: Optional[int] = 100
+    max_memory_size: Optional[int] = 100,
+    use_async: bool = False
 ) -> ReasoningAgent:
 ```
 
@@ -188,42 +226,65 @@ def create_gemma_agent(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `api_base` | str | `"http://localhost:11434/v1"` | OpenAI-compatible API endpoint |
-| `model` | str | `"gemma3:27b"` | Model name |
+| `model` | str | `"gemma3:27b"` | Model name (e.g., "gpt-4", "gemma3:27b") |
+| `api_key` | str | `"not-needed"` | API key ("not-needed" for Ollama) |
+| `temperature` | float | `0.7` | Sampling temperature (0.0-2.0) |
+| `max_tokens` | int | `None` | Max tokens to generate |
+| `top_p` | float | `None` | Nucleus sampling (0.0-1.0) |
+| `top_k` | int | `None` | Top-k sampling (Ollama only) |
 | `tools` | List[BaseTool] | `None` | Available tools |
 | `verbose` | bool | `True` | Enable verbose logging |
 | `input_schema` | Type[BaseModel] | `None` | Input validation schema |
 | `output_schema` | Type[BaseModel] | `None` | Output structure schema |
 | `output_key` | str | `None` | State key for output |
-| `state` | Dict or SharedState | `None` | State storage (dict or SharedState) |
+| `state` | SharedState | `None` | SharedState instance |
 | `max_iterations` | int | `10` | Max reasoning loops |
 | `enable_memory` | bool | `False` | Enable memory |
 | `memory_backend` | str | `"in_memory"` | Backend type |
 | `max_context_tokens` | int | `4096` | Context window size |
 | `memory_context_ratio` | float | `0.3` | Memory percentage |
 | `max_memory_size` | int | `100` | Max memories |
+| `use_async` | bool | `False` | Use AsyncOpenAI client |
 
 **Returns:**
 - `ReasoningAgent`: Configured agent instance
 
-**Example:**
+**Examples:**
 
 ```python
 from linus.agents.agent.agent import create_gemma_agent
 from linus.agents.agent.tools import get_default_tools
 
-# Basic agent
-agent = create_gemma_agent(tools=get_default_tools())
-
-# Production agent with memory
+# Ollama agent with custom parameters
 agent = create_gemma_agent(
-    tools=get_default_tools(),
-    verbose=False,
-    max_iterations=15,
-    enable_memory=True,
-    max_context_tokens=6000,
-    memory_context_ratio=0.25,
-    max_memory_size=200
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
+    max_tokens=2048,
+    top_k=40,
+    tools=get_default_tools()
 )
+
+# OpenAI agent
+agent = create_gemma_agent(
+    api_base="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="sk-your-key",
+    temperature=0.5,
+    max_tokens=1000,
+    top_p=0.9,
+    tools=get_default_tools(),
+    enable_memory=True
+)
+
+# Async agent
+agent = create_gemma_agent(
+    model="gemma3:27b",
+    use_async=True,
+    tools=get_default_tools()
+)
+result = await agent.arun("Your task")
 ```
 
 ---

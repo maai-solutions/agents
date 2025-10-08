@@ -7,21 +7,53 @@
 pip install -r requirements.txt
 
 # Or install individually
-pip install tiktoken langchain langchain-core langchain-community pydantic loguru
+pip install openai tiktoken pydantic loguru fastapi uvicorn langchain-core
 ```
+
+## Prerequisites
+
+- **Ollama** (for local models): Install from [ollama.ai](https://ollama.ai) and pull a model:
+  ```bash
+  ollama pull gemma3:27b
+  ```
+- **OpenAI API** (for cloud models): Get your API key from [platform.openai.com](https://platform.openai.com/api-keys)
 
 ## Basic Usage
 
-### Simple Agent (No Memory)
+### Simple Agent with Ollama
 
 ```python
 from linus.agents.agent.agent import create_gemma_agent
 from linus.agents.agent.tools import get_default_tools
 
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools)
+agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
+    max_tokens=2048,
+    tools=tools
+)
 
 result = agent.run("Calculate 42 * 17", return_metrics=False)
+print(result)
+```
+
+### Simple Agent with OpenAI
+
+```python
+agent = create_gemma_agent(
+    api_base="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="sk-your-api-key",
+    temperature=0.5,
+    max_tokens=1000,
+    top_p=0.9,
+    tools=tools
+)
+
+result = agent.run("What is the capital of France?")
 print(result)
 ```
 
@@ -29,6 +61,10 @@ print(result)
 
 ```python
 agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
     tools=tools,
     enable_memory=True,
     max_context_tokens=4096,
@@ -54,10 +90,15 @@ print(f"Time: {response.metrics.execution_time_seconds}s")
 
 ## Configuration Cheat Sheet
 
-### For Short Tasks
+### For Short Tasks (Ollama)
 
 ```python
 agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    api_key="not-needed",
+    temperature=0.7,
+    max_tokens=1024,
     tools=tools,
     max_iterations=5,              # Quick completion
     enable_memory=False,           # No memory needed
@@ -65,10 +106,16 @@ agent = create_gemma_agent(
 )
 ```
 
-### For Conversational Use
+### For Conversational Use (OpenAI)
 
 ```python
 agent = create_gemma_agent(
+    api_base="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="sk-your-key",
+    temperature=0.6,
+    max_tokens=2000,
+    top_p=0.9,
     tools=tools,
     max_iterations=10,
     enable_memory=True,
@@ -78,6 +125,15 @@ agent = create_gemma_agent(
     verbose=True
 )
 ```
+
+## Generation Parameters Guide
+
+| Parameter | Range | Purpose | When to Use |
+|-----------|-------|---------|-------------|
+| `temperature` | 0.0-2.0 | Controls randomness | Lower (0.3-0.5) for factual tasks, higher (0.7-1.0) for creative tasks |
+| `max_tokens` | 1-∞ | Max output length | Set based on expected response length |
+| `top_p` | 0.0-1.0 | Nucleus sampling | Alternative to temperature, usually 0.9-0.95 |
+| `top_k` | 1-∞ | Top-k sampling | Ollama only, typically 40-60 |
 
 ### For Production
 
