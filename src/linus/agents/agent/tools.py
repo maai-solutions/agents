@@ -1,12 +1,12 @@
 """Example tools for the ReasoningAgent."""
 
 from typing import Optional, Type, Any
-from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
-from langchain_core.callbacks import CallbackManagerForToolRun
 import subprocess
 import requests
 import json
+
+from .tool_base import BaseTool, StructuredTool, tool
 
 
 class SearchInput(BaseModel):
@@ -24,8 +24,7 @@ class SearchTool(BaseTool):
     def _run(
         self,
         query: str,
-        limit: int = 5,
-        run_manager: Optional[CallbackManagerForToolRun] = None
+        limit: int = 5
     ) -> str:
         """Execute the search."""
         # This is a mock implementation - replace with actual search API
@@ -49,8 +48,7 @@ class CalculatorTool(BaseTool):
     
     def _run(
         self,
-        expression: str,
-        run_manager: Optional[CallbackManagerForToolRun] = None
+        expression: str
     ) -> str:
         """Execute the calculation."""
         try:
@@ -81,8 +79,7 @@ class FileReaderTool(BaseTool):
     def _run(
         self,
         file_path: str,
-        encoding: str = "utf-8",
-        run_manager: Optional[CallbackManagerForToolRun] = None
+        encoding: str = "utf-8"
     ) -> str:
         """Read the file."""
         try:
@@ -114,8 +111,7 @@ class ShellCommandTool(BaseTool):
     def _run(
         self,
         command: str,
-        timeout: int = 30,
-        run_manager: Optional[CallbackManagerForToolRun] = None
+        timeout: int = 30
     ) -> str:
         """Execute the shell command."""
         try:
@@ -157,8 +153,7 @@ class APIRequestTool(BaseTool):
         url: str,
         method: str = "GET",
         headers: dict = None,
-        data: dict = None,
-        run_manager: Optional[CallbackManagerForToolRun] = None
+        data: dict = None
     ) -> str:
         """Make the API request."""
         try:

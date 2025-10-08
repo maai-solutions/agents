@@ -180,6 +180,7 @@ class MemoryManager:
         max_context_tokens: int = 4096,
         summary_threshold_tokens: int = 2048,
         llm: Optional[Any] = None,
+        model: Optional[str] = None,
         encoding_name: str = "cl100k_base"
     ):
         """Initialize memory manager.
@@ -188,13 +189,15 @@ class MemoryManager:
             backend: Memory storage backend
             max_context_tokens: Maximum tokens for context window
             summary_threshold_tokens: When to trigger summarization
-            llm: Language model for summarization (optional)
+            llm: Language model for summarization (OpenAI client recommended)
+            model: Model name for OpenAI client (e.g., "gpt-3.5-turbo", "gemma3:27b")
             encoding_name: Tokenizer encoding to use
         """
         self.backend = backend
         self.max_context_tokens = max_context_tokens
         self.summary_threshold_tokens = summary_threshold_tokens
         self.llm = llm
+        self.model = model or "gpt-3.5-turbo"
         self.summary: Optional[str] = None
 
         # Initialize tokenizer
@@ -278,15 +281,26 @@ class MemoryManager:
         ])
 
         try:
-            from langchain_core.messages import HumanMessage, SystemMessage
-
+            # Use OpenAI client directly
             messages = [
-                SystemMessage(content="Summarize the following conversation history concisely, preserving key information and context."),
-                HumanMessage(content=f"Conversation history:\n{memory_text}\n\nProvide a concise summary:")
+                {"role": "system", "content": "Summarize the following conversation history concisely, preserving key information and context."},
+                {"role": "user", "content": f"Conversation history:\n{memory_text}\n\nProvide a concise summary:"}
             ]
 
-            response = self.llm.invoke(messages)
-            self.summary = response.content
+            # Check if it's an OpenAI client or old LangChain LLM
+            if hasattr(self.llm, 'chat'):
+                # OpenAI client (sync or async)
+                response = self.llm.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.7
+                )
+                self.summary = response.choices[0].message.content
+            else:
+                # Fallback for other LLM types (backward compatibility)
+                logger.warning("[MEMORY] Using fallback LLM interface - consider updating to OpenAI client")
+                response = self.llm.invoke(messages)
+                self.summary = response.content if hasattr(response, 'content') else str(response)
 
             logger.info(f"[MEMORY] Created summary of {len(memories_to_summarize)} memories")
             logger.debug(f"[MEMORY] Summary: {self.summary[:200]}...")
@@ -411,6 +425,7 @@ def create_memory_manager(
     max_context_tokens: int = 4096,
     summary_threshold_tokens: int = 2048,
     llm: Optional[Any] = None,
+    model: Optional[str] = None,
     max_size: Optional[int] = None
 ) -> MemoryManager:
     """Factory function to create a memory manager.
@@ -419,11 +434,23 @@ def create_memory_manager(
         backend_type: Type of backend ("in_memory" or "vector_store")
         max_context_tokens: Maximum tokens for context window
         summary_threshold_tokens: When to trigger summarization
-        llm: Language model for summarization
+        llm: Language model for summarization (OpenAI client recommended)
+        model: Model name for OpenAI client (e.g., "gpt-3.5-turbo", "gemma3:27b")
         max_size: Maximum number of memories (for in_memory backend)
 
     Returns:
         Configured MemoryManager instance
+
+    Example:
+        from openai import OpenAI
+
+        llm = OpenAI(base_url="http://localhost:11434/v1", api_key="not-needed")
+        memory = create_memory_manager(
+            backend_type="in_memory",
+            llm=llm,
+            model="gemma3:27b",
+            max_context_tokens=4096
+        )
     """
     if backend_type == "in_memory":
         backend = InMemoryBackend(max_size=max_size)
@@ -436,5 +463,6 @@ def create_memory_manager(
         backend=backend,
         max_context_tokens=max_context_tokens,
         summary_threshold_tokens=summary_threshold_tokens,
-        llm=llm
+        llm=llm,
+        model=model
     )

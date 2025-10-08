@@ -13,8 +13,7 @@ import sys
 from datetime import datetime
 from loguru import logger
 
-from linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
-from linus.agents.agent.tools import get_default_tools, create_custom_tool
+from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_tools, create_custom_tool
 
 
 # Configure logging early
@@ -205,7 +204,7 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         execution_time = (datetime.now() - start_time).total_seconds()
 
         # Handle AgentResponse from agent.run (returns AgentResponse by default with return_metrics=True)
-        from linus.agents.agent.agent import AgentResponse as AgentResponseData
+        from linus.agents.agent import AgentResponse as AgentResponseData
 
         if isinstance(agent_response, AgentResponseData):
             # Extract the result string from AgentResponse
@@ -387,7 +386,7 @@ async def batch_queries(queries: List[str]):
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    from linus.agents.agent.agent import AgentResponse as AgentResponseData
+    from linus.agents.agent import AgentResponse as AgentResponseData
     results = []
 
     for query in queries:
@@ -425,7 +424,7 @@ async def test_scenarios():
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    from linus.agents.agent.agent import AgentResponse as AgentResponseData
+    from linus.agents.agent import AgentResponse as AgentResponseData
 
     scenarios = [
         "What is the current time?",
