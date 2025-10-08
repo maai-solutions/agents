@@ -31,12 +31,12 @@ The `ReasoningAgent` class now has an async `arun()` method alongside the sync `
 
 ```python
 import asyncio
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 async def main():
     tools = get_default_tools()
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
 
     # Use async arun instead of sync run
     result = await agent.arun("Calculate 42 * 17", return_metrics=True)
@@ -55,9 +55,9 @@ async def parallel_agents():
     tools = get_default_tools()
 
     # Create multiple agents
-    agent1 = create_gemma_agent(tools=tools)
-    agent2 = create_gemma_agent(tools=tools)
-    agent3 = create_gemma_agent(tools=tools)
+    agent1 = Agent(tools=tools)
+    agent2 = Agent(tools=tools)
+    agent3 = Agent(tools=tools)
 
     # Execute all agents in parallel
     results = await asyncio.gather(
@@ -171,7 +171,7 @@ import time
 import asyncio
 
 async def compare_agent_performance():
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
     task = "Complex calculation task"
 
     # Sync version
@@ -193,7 +193,7 @@ async def compare_agent_performance():
 
 ```python
 async def compare_multiple_agents():
-    agents = [create_gemma_agent(tools=tools) for _ in range(3)]
+    agents = [Agent(tools=tools) for _ in range(3)]
     tasks = ["Task 1", "Task 2", "Task 3"]
 
     # Sync version (sequential)
@@ -246,10 +246,10 @@ Perfect for web applications with FastAPI:
 
 ```python
 from fastapi import FastAPI
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
 app = FastAPI()
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 @app.post("/agent/query")
 async def query_agent(query: str):
@@ -348,7 +348,7 @@ result = await executor.aexecute(parallel=False)
 try:
     result = await agent.arun(query)
 except Exception as e:
-    logger.error(f"Agent failed: {e}")
+    logger.exception(f"Agent failed: {e}")
     # Handle error
 ```
 
@@ -384,13 +384,13 @@ result = await agent.arun(query)
 ```python
 # Before (sync)
 def process_data(data):
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
     result = agent.run(data)
     return result
 
 # After (async)
 async def process_data(data):
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
     result = await agent.arun(data)
     return result
 ```

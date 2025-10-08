@@ -434,7 +434,7 @@ input_mapping=None  # Passes all state
 ### ✅ Works with Memory
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     enable_memory=True
 )
@@ -460,7 +460,7 @@ for node_name, node in dag.nodes.items():
 ```python
 # Agents in DAG can use any tools
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 dag.add_node(AgentNode(name="processor", agent=agent))
 ```

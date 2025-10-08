@@ -116,9 +116,9 @@ log_metrics(metrics, title="Performance Metrics")
 ### Agent Integration
 
 ```python
-from linus.agents.agent import create_gemma_agent, get_default_tools
+from linus.agents.agent import Agent, get_default_tools
 
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools(),

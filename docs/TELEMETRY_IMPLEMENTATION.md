@@ -174,7 +174,7 @@ agent.run (root span)
 
 ```python
 from linus.agents.telemetry import initialize_telemetry
-from linus.agents.agent import create_gemma_agent, get_default_tools
+from linus.agents.agent import Agent, get_default_tools
 
 # Initialize telemetry
 initialize_telemetry(
@@ -184,7 +184,7 @@ initialize_telemetry(
 )
 
 # Create and use agent
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools()

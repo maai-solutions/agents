@@ -23,11 +23,11 @@ pip install openai tiktoken pydantic loguru fastapi uvicorn langchain-core
 ### Simple Agent with Ollama
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
-from linus.agents.agent.tools import get_default_tools
+from linus.agents.agent import Agent
+from linus.agents.agent import get_default_tools
 
 tools = get_default_tools()
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -43,7 +43,7 @@ print(result)
 ### Simple Agent with OpenAI
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="https://api.openai.com/v1",
     model="gpt-4",
     api_key="sk-your-api-key",
@@ -60,7 +60,7 @@ print(result)
 ### Agent with Memory
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -93,7 +93,7 @@ print(f"Time: {response.metrics.execution_time_seconds}s")
 ### For Short Tasks (Ollama)
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -109,7 +109,7 @@ agent = create_gemma_agent(
 ### For Conversational Use (OpenAI)
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="https://api.openai.com/v1",
     model="gpt-4",
     api_key="sk-your-key",
@@ -138,7 +138,7 @@ agent = create_gemma_agent(
 ### For Production
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     max_iterations=10,
     enable_memory=True,
@@ -155,14 +155,14 @@ agent = create_gemma_agent(
 ### Pattern 1: Single Query
 
 ```python
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 answer = agent.run("What is 100 / 4?", return_metrics=False)
 ```
 
 ### Pattern 2: Multi-Turn Conversation
 
 ```python
-agent = create_gemma_agent(tools=tools, enable_memory=True)
+agent = Agent(tools=tools, enable_memory=True)
 
 while True:
     user_input = input("You: ")
@@ -175,7 +175,7 @@ while True:
 ### Pattern 3: With Progress Tracking
 
 ```python
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 tasks = ["Calculate 10*2", "Search Python", "Get time"]
 for task in tasks:
@@ -190,13 +190,13 @@ for task in tasks:
 import json
 
 # Save session
-agent = create_gemma_agent(tools=tools, enable_memory=True)
+agent = Agent(tools=tools, enable_memory=True)
 # ... use agent ...
 with open('session.json', 'w') as f:
     json.dump(agent.memory_manager.export_memories(), f)
 
 # Restore session
-agent = create_gemma_agent(tools=tools, enable_memory=True)
+agent = Agent(tools=tools, enable_memory=True)
 with open('session.json', 'r') as f:
     agent.memory_manager.import_memories(json.load(f))
 ```

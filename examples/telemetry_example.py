@@ -20,7 +20,7 @@ import os
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from linus.agents.agent import create_gemma_agent, get_default_tools
+from linus.agents.agent import Agent, get_default_tools
 from linus.agents.telemetry import initialize_telemetry, is_telemetry_available
 
 
@@ -45,7 +45,7 @@ def example_console_exporter():
     print("✅ Telemetry initialized with console exporter")
 
     # Create agent
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         tools=get_default_tools(),
@@ -84,7 +84,7 @@ def example_jaeger_exporter():
     print("✅ Telemetry initialized with Jaeger exporter")
 
     # Create agent
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         tools=get_default_tools(),
@@ -130,7 +130,7 @@ def example_otlp_exporter():
     print("✅ Telemetry initialized with OTLP exporter")
 
     # Create agent
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         tools=get_default_tools(),

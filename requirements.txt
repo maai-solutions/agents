@@ -7,10 +7,6 @@ fastapi
 uvicorn
 
 openai
-langchain
-langchain-core
-langchain-community
-langgraph
 
 pydantic-settings
 
@@ -26,3 +22,15 @@ opentelemetry-instrumentation-fastapi
 opentelemetry-exporter-otlp
 opentelemetry-exporter-jaeger
 opentelemetry-instrumentation-openai
+
+# Langfuse observability
+langfuse
+
+# MCP (Model Context Protocol) integration
+mcp
+
+#stores
+weaviate-client
+psycopg2-binary
+
+aiohttp

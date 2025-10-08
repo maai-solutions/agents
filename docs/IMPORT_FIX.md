@@ -24,14 +24,14 @@ from openai import OpenAI, AsyncOpenAI
 
 **Before:**
 ```python
-from linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
+from linus.agents.agent.agent import ReasoningAgent, Agent
 from linus.agents.agent.tools import get_default_tools, create_custom_tool
 from linus.agents.agent.agent import AgentResponse as AgentResponseData  # 3 occurrences
 ```
 
 **After:**
 ```python
-from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_tools, create_custom_tool
+from linus.agents.agent import ReasoningAgent, Agent, get_default_tools, create_custom_tool
 from linus.agents.agent import AgentResponse as AgentResponseData  # 3 occurrences
 ```
 
@@ -64,7 +64,7 @@ This method is used by `create_custom_tool()` in `tools.py` to create tools from
 
 All imports now work correctly:
 ```bash
-PYTHONPATH=/Users/udg/Projects/ai/agents/src python -c "from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_tools, create_custom_tool; print('✅ All imports working')"
+PYTHONPATH=/Users/udg/Projects/ai/agents/src python -c "from linus.agents.agent import ReasoningAgent, Agent, get_default_tools, create_custom_tool; print('✅ All imports working')"
 ```
 
 FastAPI app loads successfully:
@@ -82,7 +82,7 @@ linus.agents.agent/
 ├── models.py            # ReasoningResult, AgentMetrics, AgentResponse
 ├── base.py              # Agent base class
 ├── reasoning_agent.py   # ReasoningAgent implementation
-├── factory.py           # create_gemma_agent()
+├── factory.py           # Agent()
 ├── tool_base.py         # BaseTool, StructuredTool, @tool
 ├── tools.py             # Tool implementations
 ├── memory.py            # MemoryManager
@@ -91,7 +91,7 @@ linus.agents.agent/
 
 **Public API (all imported from `linus.agents.agent`):**
 - `ReasoningAgent`, `Agent`
-- `create_gemma_agent`
+- `Agent` (factory function)
 - `BaseTool`, `StructuredTool`, `tool`
 - `get_default_tools`, `create_custom_tool`
 - `ReasoningResult`, `AgentMetrics`, `AgentResponse`

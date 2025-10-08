@@ -34,12 +34,12 @@ The ReasoningAgent now provides comprehensive metrics tracking for all execution
 ### Basic Usage with Metrics
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 # Create agent
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 # Run with metrics (default)
 response = agent.run("Calculate 42 * 17", return_metrics=True)

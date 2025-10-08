@@ -12,7 +12,7 @@ src/linus/agents/agent/
 ├── models.py             (2.8KB)  - Data classes and models
 ├── base.py               (6.4KB)  - Base Agent class
 ├── reasoning_agent.py    (44KB)   - ReasoningAgent implementation
-├── factory.py            (5.3KB)  - Factory functions (create_gemma_agent)
+├── factory.py            (5.3KB)  - Factory functions (Agent)
 ├── tools.py              (7.5KB)  - Tool implementations (existing)
 ├── memory.py             (14KB)   - Memory management (existing)
 └── agent_old.py          (58KB)   - Original file (backup)
@@ -46,7 +46,7 @@ Base `Agent` class with core functionality:
 
 ### `factory.py`
 Factory functions for creating agents:
-- **`create_gemma_agent()`**: Main factory with full parameter support
+- **`Agent()`**: Main factory with full parameter support
   - API configuration (api_base, api_key, model)
   - Generation parameters (temperature, max_tokens, top_p, top_k)
   - Memory management options
@@ -58,7 +58,7 @@ Module-level exports for clean imports:
 from linus.agents.agent import (
     Agent,
     ReasoningAgent,
-    create_gemma_agent,
+    Agent,
     AgentMetrics,
     AgentResponse,
     get_default_tools,
@@ -93,10 +93,10 @@ from linus.agents.agent import (
 All imports remain the same:
 ```python
 # Still works exactly as before
-from linus.agents.agent.agent import create_gemma_agent, ReasoningAgent
+from linus.agents.agent.agent import Agent, ReasoningAgent
 
 # New preferred import
-from linus.agents.agent import create_gemma_agent, ReasoningAgent
+from linus.agents.agent import Agent, ReasoningAgent
 ```
 
 ## Migration Notes

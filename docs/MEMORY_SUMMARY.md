@@ -73,7 +73,7 @@ User Input
 ### Basic Memory
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     enable_memory=True,
     max_context_tokens=4096,
@@ -89,7 +89,7 @@ agent.run("What's my name?")  # Remembers "Alice"
 ### Token-Aware Configuration
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=6000,      # Total window
     memory_context_ratio=0.25,    # 1500 tokens for memory
@@ -159,7 +159,7 @@ context = memory_mgr.get_context(
 ### Agent Creation
 
 ```python
-create_gemma_agent(
+Agent(
     # Memory settings
     enable_memory=False,              # Enable/disable
     memory_backend="in_memory",       # Backend type
@@ -382,7 +382,7 @@ agent.memory_manager.import_memories(loaded_memories)
 ### Pattern 1: Conversational Agent
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=4096,
     memory_context_ratio=0.4,  # Heavy memory use
@@ -398,7 +398,7 @@ while True:
 ### Pattern 2: Task-Oriented with Context
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=6000,
     memory_context_ratio=0.2,  # Light memory use
@@ -420,12 +420,12 @@ for task in tasks:
 
 ```python
 # Session 1
-agent = create_gemma_agent(enable_memory=True)
+agent = Agent(enable_memory=True)
 # ... conversation ...
 save_memories(agent.memory_manager.export_memories())
 
 # Session 2 (later)
-agent = create_gemma_agent(enable_memory=True)
+agent = Agent(enable_memory=True)
 agent.memory_manager.import_memories(load_memories())
 # ... continues from previous context ...
 ```

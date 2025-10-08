@@ -64,7 +64,7 @@ else:
 - Updated `state` parameter type to `Union[Dict[str, Any], 'SharedState']`
 - Inherits compatibility from base Agent class
 
-### 4. create_gemma_agent Updates
+### 4. Agent Updates
 
 **Changes**:
 - Updated `state` parameter type to `Union[Dict[str, Any], 'SharedState']`
@@ -75,10 +75,10 @@ else:
 ### Pattern 1: Dict State (Traditional)
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
 state = {"user_id": 123}
-agent = create_gemma_agent(tools=tools, state=state)
+agent = Agent(tools=tools, state=state)
 
 # Use as dict
 agent.state["user_id"]  # 123
@@ -93,7 +93,7 @@ from linus.agents.graph.state import SharedState
 shared_state = SharedState()
 shared_state.set("user_id", 123, source="init")
 
-agent = create_gemma_agent(tools=tools, state=shared_state)
+agent = Agent(tools=tools, state=shared_state)
 
 # Use identically to dict - StateWrapper provides interface
 agent.state["user_id"]  # 123
@@ -112,8 +112,8 @@ from linus.agents.graph.state import SharedState
 shared_state = SharedState()
 
 # Multiple agents share same state
-agent1 = create_gemma_agent(tools=tools, state=shared_state)
-agent2 = create_gemma_agent(tools=tools, state=shared_state)
+agent1 = Agent(tools=tools, state=shared_state)
+agent2 = Agent(tools=tools, state=shared_state)
 
 # Agent 1 sets data
 agent1.state["result"] = "done"
@@ -131,8 +131,8 @@ from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor, SharedState
 state = SharedState()
 
 # Create agents with shared state
-analyzer = create_gemma_agent(tools=tools, state=state)
-processor = create_gemma_agent(tools=tools, state=state)
+analyzer = Agent(tools=tools, state=state)
+processor = Agent(tools=tools, state=state)
 
 # Build and execute DAG
 dag = AgentDAG("Pipeline")
@@ -196,7 +196,7 @@ When using SharedState, you get additional features:
 
 1. **API.md**
    - Added "State Management" section
-   - Updated Agent and create_gemma_agent parameters
+   - Updated Agent and Agent factory parameters
    - Comprehensive examples and best practices
 
 2. **README.md**
@@ -267,12 +267,12 @@ Existing code using dict state can migrate gradually:
 
 ```python
 # Old code (still works)
-agent = create_gemma_agent(tools=tools, state={"key": "value"})
+agent = Agent(tools=tools, state={"key": "value"})
 
 # New code (seamless upgrade)
 shared_state = SharedState()
 shared_state.set("key", "value", source="init")
-agent = create_gemma_agent(tools=tools, state=shared_state)
+agent = Agent(tools=tools, state=shared_state)
 
 # Agent code unchanged!
 agent.state["key"]  # Works identically

@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 from linus.agents.graph.state import SharedState
 from loguru import logger
@@ -25,7 +25,7 @@ def example_dict_state():
         "counter": 0
     }
 
-    agent = create_gemma_agent(
+    agent = Agent(
         tools=tools,
         state=state,
         verbose=False,
@@ -59,7 +59,7 @@ def example_shared_state():
     shared_state.set("session", "xyz-789", source="init")
 
     # Create agent with SharedState
-    agent = create_gemma_agent(
+    agent = Agent(
         tools=tools,
         state=shared_state,
         verbose=False,
@@ -104,14 +104,14 @@ def example_multi_agent_sharing():
     shared_state.set("task", "process_data", source="coordinator")
 
     # Create two agents sharing the same state
-    agent1 = create_gemma_agent(
+    agent1 = Agent(
         tools=tools,
         state=shared_state,
         verbose=False,
         max_iterations=2
     )
 
-    agent2 = create_gemma_agent(
+    agent2 = Agent(
         tools=tools,
         state=shared_state,
         verbose=False,
@@ -153,7 +153,7 @@ def example_state_wrapper_features():
     tools = get_default_tools()
     shared_state = SharedState()
 
-    agent = create_gemma_agent(
+    agent = Agent(
         tools=tools,
         state=shared_state,
         verbose=False,
@@ -230,7 +230,7 @@ def example_backward_compatibility():
     # Test with dict state
     print("\n🔹 Using dict state:")
     dict_state = {"data": [1, 2, 3, 4, 5]}
-    agent_dict = create_gemma_agent(tools=tools, state=dict_state, verbose=False, max_iterations=2)
+    agent_dict = Agent(tools=tools, state=dict_state, verbose=False, max_iterations=2)
     result1 = process_with_agent(agent_dict)
     print(f"   Result: {result1}")
     print(f"   Data count: {agent_dict.state.get('data_count')}")
@@ -239,7 +239,7 @@ def example_backward_compatibility():
     print("\n🔹 Using SharedState:")
     shared = SharedState()
     shared.set("data", [1, 2, 3, 4, 5], source="init")
-    agent_shared = create_gemma_agent(tools=tools, state=shared, verbose=False, max_iterations=2)
+    agent_shared = Agent(tools=tools, state=shared, verbose=False, max_iterations=2)
     result2 = process_with_agent(agent_shared)
     print(f"   Result: {result2}")
     print(f"   Data count: {agent_shared.state.get('data_count')}")
@@ -267,4 +267,4 @@ if __name__ == "__main__":
         print("="*80)
 
     except Exception as e:
-        logger.error(f"Example failed: {e}", exc_info=True)
+        logger.exception(f"Example failed: {e}", exc_info=True)

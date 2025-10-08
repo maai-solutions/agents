@@ -5,7 +5,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor, SharedState
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 from loguru import logger
 
@@ -29,25 +29,25 @@ def example_data_pipeline():
     tools = get_default_tools()
 
     # Create specialized agents
-    ingestion_agent = create_gemma_agent(
+    ingestion_agent = Agent(
         tools=tools,
         verbose=False,
         max_iterations=3
     )
 
-    stats_agent = create_gemma_agent(
+    stats_agent = Agent(
         tools=tools,
         verbose=False,
         max_iterations=5
     )
 
-    pattern_agent = create_gemma_agent(
+    pattern_agent = Agent(
         tools=tools,
         verbose=False,
         max_iterations=5
     )
 
-    report_agent = create_gemma_agent(
+    report_agent = Agent(
         tools=tools,
         verbose=False,
         max_iterations=3
@@ -153,10 +153,10 @@ def example_conditional_workflow():
     tools = get_default_tools()
 
     # Create agents
-    analyzer = create_gemma_agent(tools=tools, verbose=False, max_iterations=3)
-    numeric_processor = create_gemma_agent(tools=tools, verbose=False, max_iterations=4)
-    text_processor = create_gemma_agent(tools=tools, verbose=False, max_iterations=4)
-    report_generator = create_gemma_agent(tools=tools, verbose=False, max_iterations=3)
+    analyzer = Agent(tools=tools, verbose=False, max_iterations=3)
+    numeric_processor = Agent(tools=tools, verbose=False, max_iterations=4)
+    text_processor = Agent(tools=tools, verbose=False, max_iterations=4)
+    report_generator = Agent(tools=tools, verbose=False, max_iterations=3)
 
     # Build DAG
     dag = AgentDAG(name="ConditionalWorkflow")
@@ -243,9 +243,9 @@ def example_error_recovery():
     tools = get_default_tools()
 
     # Create agents
-    primary = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    recovery = create_gemma_agent(tools=tools, verbose=False, max_iterations=3)
-    validator = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
+    primary = Agent(tools=tools, verbose=False, max_iterations=2)
+    recovery = Agent(tools=tools, verbose=False, max_iterations=3)
+    validator = Agent(tools=tools, verbose=False, max_iterations=2)
 
     # Build DAG
     dag = AgentDAG(name="ErrorRecovery")
@@ -306,17 +306,17 @@ if __name__ == "__main__":
     try:
         example_data_pipeline()
     except Exception as e:
-        logger.error(f"Data pipeline example failed: {e}", exc_info=True)
+        logger.exception(f"Data pipeline example failed: {e}", exc_info=True)
 
     try:
         example_conditional_workflow()
     except Exception as e:
-        logger.error(f"Conditional workflow example failed: {e}", exc_info=True)
+        logger.exception(f"Conditional workflow example failed: {e}", exc_info=True)
 
     try:
         example_error_recovery()
     except Exception as e:
-        logger.error(f"Error recovery example failed: {e}", exc_info=True)
+        logger.exception(f"Error recovery example failed: {e}", exc_info=True)
 
     print("\n" + "="*80)
     print("EXAMPLES COMPLETE")

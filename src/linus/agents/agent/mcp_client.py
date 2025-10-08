@@ -115,7 +115,7 @@ class MCPTool(BaseTool):
 
         except Exception as e:
             error_msg = f"Error calling MCP tool '{self.mcp_tool_name}': {str(e)}"
-            logger.error(f"[MCP] {error_msg}")
+            logger.exception(f"[MCP] {error_msg}")
             return error_msg
 
 
@@ -226,7 +226,7 @@ class MCPClientManager:
 
                 logger.info(f"[MCP] Disconnected from server '{server_name}'")
             except Exception as e:
-                logger.error(f"[MCP] Error disconnecting from '{server_name}': {e}")
+                logger.exception(f"[MCP] Error disconnecting from '{server_name}': {e}")
 
 
 async def connect_mcp_servers(

@@ -1,6 +1,6 @@
 """Factory functions for creating agents."""
 
-from typing import List, Optional, Type
+from typing import List, Optional, Type, Any
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
 from loguru import logger
@@ -19,7 +19,7 @@ except ImportError:
 
 
 # Example usage function
-def create_gemma_agent(
+def Agent(
     api_base: str = "http://localhost:11434/v1",  # Ollama OpenAI-compatible endpoint
     model: str = "gemma3:27b",
     api_key: str = "not-needed",
@@ -39,7 +39,10 @@ def create_gemma_agent(
     max_context_tokens: int = 4096,
     memory_context_ratio: float = 0.3,
     max_memory_size: Optional[int] = 100,
-    use_async: bool = False
+    use_async: bool = False,
+    use_json_format: bool = False,
+    tracer: Optional[Any] = None,
+    session_id: Optional[str] = None
 ) -> ReasoningAgent:
     """Create a ReasoningAgent configured for Gemma3:27b or other OpenAI-compatible models.
 
@@ -64,13 +67,16 @@ def create_gemma_agent(
         memory_context_ratio: Ratio of context to use for memory (0.0 to 1.0)
         max_memory_size: Maximum number of memories to keep (None for unlimited)
         use_async: Whether to use AsyncOpenAI client (default: False for OpenAI client)
+        use_json_format: Whether to use response_format={"type": "json_object"} (default: False, not all models support this)
+        tracer: Optional telemetry tracer (AgentTracer or LangfuseTracer)
+        session_id: Optional session ID for Langfuse session grouping
 
     Returns:
         Configured ReasoningAgent instance
 
     Examples:
         # For Ollama (local):
-        agent = create_gemma_agent(
+        agent = Agent(
             api_base="http://localhost:11434/v1",
             model="gemma3:27b",
             api_key="not-needed",
@@ -80,7 +86,7 @@ def create_gemma_agent(
         )
 
         # For OpenAI:
-        agent = create_gemma_agent(
+        agent = Agent(
             api_base="https://api.openai.com/v1",
             model="gpt-4",
             api_key="sk-...",
@@ -119,7 +125,7 @@ def create_gemma_agent(
     elif enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
-    return ReasoningAgent(
+    agent = ReasoningAgent(
         llm=llm,
         model=model,
         tools=tools,
@@ -134,5 +140,17 @@ def create_gemma_agent(
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
-        top_k=top_k
+        top_k=top_k,
+        api_base=api_base,
+        use_json_format=use_json_format
     )
+
+    # Override tracer if provided
+    if tracer is not None:
+        agent.tracer = tracer
+
+    # If session_id is provided but no tracer, update the agent's tracer if it's a LangfuseTracer
+    if session_id is not None and hasattr(agent.tracer, 'session_id'):
+        agent.tracer.session_id = session_id
+
+    return agent

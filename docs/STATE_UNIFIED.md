@@ -45,7 +45,7 @@ The agent system now uses **SharedState exclusively** for all state management a
 ### Basic Agent with State
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.graph.state import SharedState
 
 # Create shared state
@@ -53,7 +53,7 @@ state = SharedState()
 state.set("user_id", 123, source="init")
 
 # Create agent - state is now a SharedState instance
-agent = create_gemma_agent(tools=tools, state=state)
+agent = Agent(tools=tools, state=state)
 
 # Access state using SharedState methods
 value = state.get("user_id")  # 123
@@ -64,7 +64,7 @@ all_data = state.get_all()    # {'user_id': 123}
 
 ```python
 # If no state provided, SharedState is created automatically
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 # Agent has a SharedState instance
 agent.state.set("key", "value", source="agent")
@@ -80,9 +80,9 @@ from linus.agents.graph.state import SharedState
 shared_state = SharedState()
 
 # All agents share the same state
-agent1 = create_gemma_agent(tools=tools, state=shared_state)
-agent2 = create_gemma_agent(tools=tools, state=shared_state)
-agent3 = create_gemma_agent(tools=tools, state=shared_state)
+agent1 = Agent(tools=tools, state=shared_state)
+agent2 = Agent(tools=tools, state=shared_state)
+agent3 = Agent(tools=tools, state=shared_state)
 
 # Agent 1 sets data
 shared_state.set("step1_complete", True, source="agent1")
@@ -100,9 +100,9 @@ from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor, SharedState
 state = SharedState()
 
 # Create agents with shared state
-analyzer = create_gemma_agent(tools=tools, state=state)
-processor = create_gemma_agent(tools=tools, state=state)
-reporter = create_gemma_agent(tools=tools, state=state)
+analyzer = Agent(tools=tools, state=state)
+processor = Agent(tools=tools, state=state)
+reporter = Agent(tools=tools, state=state)
 
 # Build DAG
 dag = AgentDAG("Pipeline")
@@ -197,7 +197,7 @@ If you have existing code using dict state:
 ```python
 # This no longer works
 state = {"key": "value"}
-agent = create_gemma_agent(tools=tools, state=state)
+agent = Agent(tools=tools, state=state)
 ```
 
 ### After (Using SharedState)
@@ -208,7 +208,7 @@ from linus.agents.graph.state import SharedState
 
 state = SharedState()
 state.set("key", "value", source="init")
-agent = create_gemma_agent(tools=tools, state=state)
+agent = Agent(tools=tools, state=state)
 ```
 
 ### Accessing State
@@ -268,11 +268,11 @@ if state_data:
 ### Example 1: Simple Agent
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 # Agent has SharedState automatically
 agent.state.set("task", "process_data", source="user")
@@ -294,8 +294,8 @@ state = SharedState()
 state.set("input_data", "Sales figures Q4 2024", source="system")
 
 # Create agents sharing state
-agent1 = create_gemma_agent(tools=tools, state=state)
-agent2 = create_gemma_agent(tools=tools, state=state)
+agent1 = Agent(tools=tools, state=state)
+agent2 = Agent(tools=tools, state=state)
 
 # Agent 1 processes
 result1 = await agent1.arun("Analyze the input data")

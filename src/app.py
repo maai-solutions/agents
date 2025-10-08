@@ -3,7 +3,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 import json
@@ -13,8 +12,15 @@ import sys
 from datetime import datetime
 from loguru import logger
 
-from linus.agents.agent import ReasoningAgent, create_gemma_agent, get_default_tools, create_custom_tool
-from linus.agents.telemetry import initialize_telemetry, is_telemetry_available
+from dotenv import load_dotenv
+
+from linus.agents.tools.entities_search import EntitiesSearchTool
+from linus.agents.tools.vector_store import VectorStoreTool
+load_dotenv()
+
+from linus.agents.agent import ReasoningAgent, Agent, get_default_tools, create_custom_tool
+from linus.agents.telemetry import initialize_telemetry, get_tracer
+from linus.settings import Settings
 
 
 # Configure logging early with rich support
@@ -53,36 +59,6 @@ logger.add(
 )
 
 
-class Settings(BaseSettings):
-    """Application settings."""
-    
-    app_name: str = "ReasoningAgent API"
-    app_version: str = "1.0.0"
-    
-    # Gemma/Ollama configuration
-    llm_api_base: str = "http://localhost:11434/v1"
-    llm_model: str = "gemma3:27b"
-    llm_temperature: float = 0.7
-    
-    # Agent configuration
-    agent_verbose: bool = True
-    agent_timeout: int = 300  # 5 minutes timeout
-
-    # Telemetry configuration
-    telemetry_enabled: bool = False
-    telemetry_exporter: str = "console"  # console, otlp, jaeger
-    telemetry_otlp_endpoint: str = "http://localhost:4317"
-    telemetry_jaeger_endpoint: str = "localhost"
-
-    # API configuration
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-
 settings = Settings()
 
 # Global agent instance
@@ -112,6 +88,7 @@ class AgentResponse(BaseModel):
     timestamp: str
     session_id: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
+    model_params: Optional[Dict[str, Any]] = None
 
 
 class ToolTestRequest(BaseModel):
@@ -139,47 +116,68 @@ async def lifespan(app: FastAPI):
     logger.info("Starting ReasoningAgent API...")
 
     # Initialize telemetry if enabled
-    if settings.telemetry_enabled and is_telemetry_available():
-        logger.info("[TELEMETRY] Initializing OpenTelemetry tracing...")
-        initialize_telemetry(
+    tracer = None
+    if settings.telemetry_enabled:
+        logger.info(f"[TELEMETRY] Initializing {settings.telemetry_exporter} tracing...")
+
+        # Use Langfuse keys if available, otherwise fall back to generic telemetry keys
+        langfuse_public = settings.langfuse_public_key or settings.telemetry_public_key or None
+        langfuse_secret = settings.langfuse_secret_key or settings.telemetry_secret_key or None
+
+        tracer = initialize_telemetry(
             service_name="reasoning-agent-api",
             exporter_type=settings.telemetry_exporter,
             otlp_endpoint=settings.telemetry_otlp_endpoint,
             jaeger_endpoint=settings.telemetry_jaeger_endpoint,
+            langfuse_public_key=langfuse_public,
+            langfuse_secret_key=langfuse_secret,
+            langfuse_host=settings.langfuse_host,
             enabled=True
         )
         logger.info(f"[TELEMETRY] Tracing enabled with {settings.telemetry_exporter} exporter")
-    elif settings.telemetry_enabled and not is_telemetry_available():
-        logger.warning("[TELEMETRY] Telemetry requested but OpenTelemetry not installed")
+    else:
+        logger.info("[TELEMETRY] Telemetry disabled")
 
     try:
         # Initialize the agent
-        tools = get_default_tools()
-        
+        tools = []
+
         # Add some custom tools for testing
         def get_time() -> str:
             """Get the current time."""
             return f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
+
         time_tool = create_custom_tool(
             name="get_time",
             description="Get the current date and time",
             func=get_time
         )
         tools.append(time_tool)
+
+        vector_store_tool = VectorStoreTool()
+        tools.append(vector_store_tool)
         
-        agent = create_gemma_agent(
+        entities_search_tool = EntitiesSearchTool()
+        tools.append(entities_search_tool)
+
+        agent = Agent(
             api_base=settings.llm_api_base,
             model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            top_p=settings.llm_top_p,
+            top_k=settings.llm_top_k,
             tools=tools,
-            verbose=settings.agent_verbose
+            verbose=settings.agent_verbose,
+            tracer=tracer
         )
         
         logger.info(f"Agent initialized with {len(tools)} tools")
         logger.info(f"Using model: {settings.llm_model} at {settings.llm_api_base}")
         
     except Exception as e:
-        logger.error(f"Failed to initialize agent: {e}")
+        logger.exception(f"Failed to initialize agent: {e}")
         raise
     
     yield
@@ -274,6 +272,16 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
             reasoning = None
             metrics = None
 
+        # Extract model parameters from agent
+        model_params = {
+            "base_url": agent.api_base,
+            "model": agent.model,
+            "temperature": agent.temperature,
+            "max_tokens": agent.max_tokens,
+            "top_p": agent.top_p,
+            "top_k": agent.top_k
+        }
+
         response = AgentResponse(
             query=request.query,
             response=result_text,
@@ -282,7 +290,8 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
             execution_time=execution_time,
             timestamp=datetime.now().isoformat(),
             session_id=request.session_id,
-            metrics=metrics
+            metrics=metrics,
+            model_params=model_params
         )
         
         # Store in conversation history
@@ -300,7 +309,7 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
             detail=f"Agent query timed out after {settings.agent_timeout} seconds"
         )
     except Exception as e:
-        logger.error(f"Error processing query: {e}")
+        logger.exception(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -329,7 +338,7 @@ async def test_reasoning(request: AgentRequest):
         }
         
     except Exception as e:
-        logger.error(f"Error in reasoning phase: {e}")
+        logger.exception(f"Error in reasoning phase: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -366,7 +375,7 @@ async def test_tool(request: ToolTestRequest):
         }
         
     except Exception as e:
-        logger.error(f"Error executing tool {request.tool_name}: {e}")
+        logger.exception(f"Error executing tool {request.tool_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

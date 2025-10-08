@@ -7,7 +7,7 @@ This module provides comprehensive tracing for:
 - Performance metrics
 """
 
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, TYPE_CHECKING
 from functools import wraps
 import os
 from loguru import logger
@@ -24,41 +24,67 @@ try:
     OTEL_AVAILABLE = True
 except ImportError:
     OTEL_AVAILABLE = False
+    trace = None  # Set to None when not available
     logger.warning("OpenTelemetry not installed. Install with: pip install opentelemetry-api opentelemetry-sdk")
+
+# Langfuse imports (optional dependency)
+try:
+    from langfuse import Langfuse
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
+    logger.warning("Langfuse not installed. Install with: pip install langfuse")
 
 
 class TelemetryConfig:
-    """Configuration for OpenTelemetry tracing."""
+    """Configuration for telemetry (OpenTelemetry and Langfuse)."""
 
     def __init__(
         self,
         service_name: str = "reasoning-agent",
-        exporter_type: str = "console",  # console, otlp, jaeger
+        exporter_type: str = "console",  # console, otlp, jaeger, langfuse
         otlp_endpoint: Optional[str] = None,
         jaeger_endpoint: Optional[str] = None,
+        langfuse_public_key: Optional[str] = None,
+        langfuse_secret_key: Optional[str] = None,
+        langfuse_host: Optional[str] = None,
         enabled: bool = True
     ):
         """Initialize telemetry configuration.
 
         Args:
             service_name: Name of the service for tracing
-            exporter_type: Type of exporter (console, otlp, jaeger)
+            exporter_type: Type of exporter (console, otlp, jaeger, langfuse)
             otlp_endpoint: OTLP endpoint URL (e.g., "http://localhost:4317")
             jaeger_endpoint: Jaeger endpoint (e.g., "localhost", port 6831)
+            langfuse_public_key: Langfuse public API key
+            langfuse_secret_key: Langfuse secret API key
+            langfuse_host: Langfuse host URL (default: "https://cloud.langfuse.com")
             enabled: Whether tracing is enabled
         """
         self.service_name = service_name
         self.exporter_type = exporter_type
         self.otlp_endpoint = otlp_endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
         self.jaeger_endpoint = jaeger_endpoint or os.getenv("JAEGER_AGENT_HOST", "localhost")
-        self.enabled = enabled and OTEL_AVAILABLE
 
-        if not OTEL_AVAILABLE and enabled:
-            logger.warning("Telemetry requested but OpenTelemetry not available")
+        # Langfuse configuration
+        self.langfuse_public_key = langfuse_public_key or os.getenv("LANGFUSE_PUBLIC_KEY")
+        self.langfuse_secret_key = langfuse_secret_key or os.getenv("LANGFUSE_SECRET_KEY")
+        self.langfuse_host = langfuse_host or os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+        # Check if the selected exporter is available
+        if exporter_type == "langfuse":
+            self.enabled = enabled and LANGFUSE_AVAILABLE
+            if not LANGFUSE_AVAILABLE and enabled:
+                logger.warning("Langfuse requested but not available. Install with: pip install langfuse")
+        else:
+            self.enabled = enabled and OTEL_AVAILABLE
+            if not OTEL_AVAILABLE and enabled:
+                logger.warning("Telemetry requested but OpenTelemetry not available")
 
 
-def setup_telemetry(config: TelemetryConfig) -> Optional[trace.Tracer]:
-    """Setup OpenTelemetry tracing.
+def setup_telemetry(config: TelemetryConfig) -> Optional[Any]:
+    """Setup tracing (OpenTelemetry or Langfuse).
 
     Args:
         config: Telemetry configuration
@@ -66,10 +92,33 @@ def setup_telemetry(config: TelemetryConfig) -> Optional[trace.Tracer]:
     Returns:
         Tracer instance if enabled, None otherwise
     """
-    if not config.enabled or not OTEL_AVAILABLE:
+    if not config.enabled:
         return None
 
     try:
+        # Setup Langfuse
+        if config.exporter_type == "langfuse":
+            if not LANGFUSE_AVAILABLE:
+                logger.error("[TELEMETRY] Langfuse requested but not available")
+                return None
+
+            if not config.langfuse_public_key or not config.langfuse_secret_key:
+                logger.error("[TELEMETRY] Langfuse credentials not provided")
+                return None
+
+            langfuse_client = Langfuse(
+                public_key=config.langfuse_public_key,
+                secret_key=config.langfuse_secret_key,
+                host=config.langfuse_host
+            )
+            logger.info(f"[TELEMETRY] Langfuse initialized at {config.langfuse_host}")
+            return langfuse_client
+
+        # Setup OpenTelemetry
+        if not OTEL_AVAILABLE:
+            logger.error("[TELEMETRY] OpenTelemetry requested but not available")
+            return None
+
         # Create resource with service name
         resource = Resource(attributes={
             SERVICE_NAME: config.service_name
@@ -108,14 +157,233 @@ def setup_telemetry(config: TelemetryConfig) -> Optional[trace.Tracer]:
         return tracer
 
     except Exception as e:
-        logger.error(f"[TELEMETRY] Failed to setup telemetry: {e}")
+        logger.exception(f"[TELEMETRY] Failed to setup telemetry: {e}")
         return None
+
+
+class LangfuseTracer:
+    """Tracer wrapper for Langfuse observability."""
+
+    def __init__(self, langfuse_client: Optional[Any] = None, session_id: Optional[str] = None):
+        """Initialize Langfuse tracer.
+
+        Args:
+            langfuse_client: Langfuse client instance
+            session_id: Session ID for grouping related traces
+        """
+        self.client = langfuse_client
+        self.enabled = langfuse_client is not None and LANGFUSE_AVAILABLE
+        self.session_id = session_id
+        self._current_trace = None
+        self._current_spans = {}  # Stack of spans by name
+
+    def trace_agent_run(
+        self,
+        user_input: str,
+        agent_type: str = "ReasoningAgent"
+    ) -> Any:
+        """Create a trace for agent execution.
+
+        Args:
+            user_input: User's input query
+            agent_type: Type of agent
+
+        Returns:
+            Trace context
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Build metadata
+        metadata = {"agent_type": agent_type}
+        if self.session_id:
+            metadata["sessionId"] = self.session_id
+
+        # Use start_as_current_span to create the root trace/span
+        return self.client.start_as_current_span(
+            name="agent_run",
+            input=user_input,
+            metadata=metadata
+        )
+
+    def trace_reasoning_phase(
+        self,
+        input_text: str,
+        iteration: int
+    ) -> Any:
+        """Create a span for reasoning phase.
+
+        Args:
+            input_text: Input to reasoning phase
+            iteration: Current iteration number
+
+        Returns:
+            Span context
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Create a child span for reasoning
+        return self.client.start_as_current_span(
+            name="reasoning_phase",
+            input={"text": input_text, "iteration": iteration}
+        )
+
+    def trace_llm_call(
+        self,
+        prompt: str,
+        model: str,
+        call_type: str = "completion"
+    ) -> Any:
+        """Create a span for LLM call.
+
+        Args:
+            prompt: Prompt sent to LLM
+            model: Model name
+            call_type: Type of call (reasoning, tool_args, generate)
+
+        Returns:
+            Span context
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Use start_as_current_observation for LLM calls
+        return self.client.start_as_current_observation(
+            name=f"llm_{call_type}",
+            as_type="generation",
+            model=model,
+            input=prompt,
+            metadata={"call_type": call_type}
+        )
+
+    def trace_tool_execution(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any]
+    ) -> Any:
+        """Create a span for tool execution.
+
+        Args:
+            tool_name: Name of the tool
+            tool_args: Arguments passed to tool
+
+        Returns:
+            Span context
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Create a child span for tool execution
+        return self.client.start_as_current_span(
+            name=f"tool_{tool_name}",
+            input=tool_args,
+            metadata={"tool": tool_name}
+        )
+
+    def add_event(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        """Add an event to the current trace.
+
+        Args:
+            name: Event name
+            attributes: Event attributes
+        """
+        if not self.enabled:
+            return
+
+        # Create an event using the Langfuse client
+        try:
+            self.client.create_event(
+                name=name,
+                metadata=attributes or {}
+            )
+        except Exception:
+            pass  # Silently ignore if event creation fails
+
+    def set_attribute(self, key: str, value: Any):
+        """Set metadata on the current trace/span.
+
+        Args:
+            key: Attribute key
+            value: Attribute value
+        """
+        if not self.enabled:
+            return
+
+        # Update current span/trace metadata
+        try:
+            self.client.update_current_trace(metadata={key: value})
+        except Exception:
+            pass  # Silently ignore if update fails
+
+    def record_exception(self, exception: Exception):
+        """Record an exception in the current trace.
+
+        Args:
+            exception: Exception to record
+        """
+        if not self.enabled:
+            return
+
+        try:
+            self.client.update_current_trace(
+                output={"error": str(exception)},
+                level="ERROR"
+            )
+        except Exception:
+            pass  # Silently ignore if update fails
+
+    def set_status(self, status_code: str, description: str = ""):
+        """Set the status of the current trace.
+
+        Args:
+            status_code: Status code (OK, ERROR)
+            description: Status description
+        """
+        if not self.enabled:
+            return
+
+        try:
+            level = "DEFAULT" if status_code == "OK" else "ERROR"
+            self.client.update_current_trace(
+                level=level,
+                metadata={"status": status_code, "description": description}
+            )
+        except Exception:
+            pass  # Silently ignore if update fails
+
+    def update_generation(self, output: str, usage: Optional[Dict[str, int]] = None):
+        """Update the current LLM generation with output and usage stats.
+
+        Args:
+            output: Generated output
+            usage: Token usage stats (prompt_tokens, completion_tokens, total_tokens)
+        """
+        if not self.enabled:
+            return
+
+        try:
+            update_kwargs = {"output": output}
+            if usage:
+                update_kwargs["usage"] = usage
+            self.client.update_current_generation(**update_kwargs)
+        except Exception:
+            pass  # Silently ignore if update fails
+
+    def flush(self):
+        """Flush pending traces to Langfuse."""
+        if self.enabled and self.client:
+            self.client.flush()
 
 
 class AgentTracer:
     """Tracer wrapper for agent operations."""
 
-    def __init__(self, tracer: Optional[trace.Tracer] = None):
+    def __init__(self, tracer: Optional[Any] = None):
         """Initialize agent tracer.
 
         Args:
@@ -292,15 +560,15 @@ class AgentTracer:
                 span.set_status(Status(StatusCode.ERROR, description))
 
 
-# Global tracer instance
-_global_tracer: Optional[AgentTracer] = None
+# Global tracer instance (can be either AgentTracer or LangfuseTracer)
+_global_tracer: Optional[Any] = None
 
 
-def get_tracer() -> AgentTracer:
-    """Get the global agent tracer.
+def get_tracer():
+    """Get the global tracer.
 
     Returns:
-        AgentTracer instance
+        AgentTracer or LangfuseTracer instance
     """
     global _global_tracer
     if _global_tracer is None:
@@ -313,19 +581,27 @@ def initialize_telemetry(
     exporter_type: str = "console",
     otlp_endpoint: Optional[str] = None,
     jaeger_endpoint: Optional[str] = None,
+    langfuse_public_key: Optional[str] = None,
+    langfuse_secret_key: Optional[str] = None,
+    langfuse_host: Optional[str] = None,
+    session_id: Optional[str] = None,
     enabled: bool = True
-) -> AgentTracer:
+):
     """Initialize global telemetry.
 
     Args:
         service_name: Name of the service
-        exporter_type: Type of exporter (console, otlp, jaeger)
+        exporter_type: Type of exporter (console, otlp, jaeger, langfuse)
         otlp_endpoint: OTLP endpoint URL
         jaeger_endpoint: Jaeger endpoint
+        langfuse_public_key: Langfuse public API key
+        langfuse_secret_key: Langfuse secret API key
+        langfuse_host: Langfuse host URL
+        session_id: Session ID for grouping related traces (Langfuse only)
         enabled: Whether to enable tracing
 
     Returns:
-        AgentTracer instance
+        AgentTracer or LangfuseTracer instance
     """
     global _global_tracer
 
@@ -334,11 +610,19 @@ def initialize_telemetry(
         exporter_type=exporter_type,
         otlp_endpoint=otlp_endpoint,
         jaeger_endpoint=jaeger_endpoint,
+        langfuse_public_key=langfuse_public_key,
+        langfuse_secret_key=langfuse_secret_key,
+        langfuse_host=langfuse_host,
         enabled=enabled
     )
 
-    tracer = setup_telemetry(config)
-    _global_tracer = AgentTracer(tracer)
+    tracer_backend = setup_telemetry(config)
+
+    # Return appropriate tracer based on exporter type
+    if config.exporter_type == "langfuse":
+        _global_tracer = LangfuseTracer(tracer_backend, session_id=session_id)
+    else:
+        _global_tracer = AgentTracer(tracer_backend)
 
     return _global_tracer
 
@@ -350,6 +634,15 @@ def is_telemetry_available() -> bool:
         True if available, False otherwise
     """
     return OTEL_AVAILABLE
+
+
+def is_langfuse_available() -> bool:
+    """Check if Langfuse is available.
+
+    Returns:
+        True if available, False otherwise
+    """
+    return LANGFUSE_AVAILABLE
 
 
 def trace_method(span_name: str, **span_attributes):
@@ -371,8 +664,8 @@ def trace_method(span_name: str, **span_attributes):
             if not tracer.enabled:
                 return func(self, *args, **kwargs)
 
-            # Create span
-            if OTEL_AVAILABLE:
+            # Create span - handle both AgentTracer (OpenTelemetry) and LangfuseTracer
+            if isinstance(tracer, AgentTracer) and OTEL_AVAILABLE and tracer.tracer:
                 with tracer.tracer.start_as_current_span(span_name) as span:
                     # Add static attributes
                     for key, value in span_attributes.items():
@@ -388,6 +681,8 @@ def trace_method(span_name: str, **span_attributes):
                         span.set_status(Status(StatusCode.ERROR, str(e)))
                         raise
             else:
+                # For LangfuseTracer or when OpenTelemetry is not available,
+                # just execute the function without tracing
                 return func(self, *args, **kwargs)
 
         return wrapper

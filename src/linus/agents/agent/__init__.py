@@ -15,7 +15,7 @@ from .base import Agent
 from .reasoning_agent import ReasoningAgent
 
 # Factory functions
-from .factory import create_gemma_agent
+from .factory import Agent
 
 # Tool base classes
 from .tool_base import BaseTool, StructuredTool, tool
@@ -54,7 +54,7 @@ __all__ = [
     "Agent",
     "ReasoningAgent",
     # Factory
-    "create_gemma_agent",
+    "Agent",
     # Tool base classes
     "BaseTool",
     "StructuredTool",

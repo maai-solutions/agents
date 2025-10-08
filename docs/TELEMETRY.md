@@ -1,8 +1,15 @@
-# OpenTelemetry Tracing
+# Telemetry & Observability
 
 ## Overview
 
-The ReasoningAgent now includes comprehensive **OpenTelemetry tracing** to monitor and debug agent behavior, LLM interactions, and tool usage in production.
+The ReasoningAgent includes comprehensive **telemetry and observability** to monitor and debug agent behavior, LLM interactions, and tool usage in production.
+
+### Supported Backends
+
+- **OpenTelemetry** - Industry-standard distributed tracing (Console, OTLP, Jaeger)
+- **Langfuse** - LLM-specific observability platform (⭐ Recommended for LLM applications)
+
+For detailed Langfuse setup and features, see [LANGFUSE_INTEGRATION.md](LANGFUSE_INTEGRATION.md).
 
 ### What Gets Traced
 
@@ -54,7 +61,7 @@ pip install -r requirements.txt
 Print traces to console for debugging:
 
 ```python
-from linus.agents.agent import create_gemma_agent, get_default_tools
+from linus.agents.agent import Agent, get_default_tools
 from linus.agents.telemetry import initialize_telemetry
 
 # Initialize telemetry
@@ -65,7 +72,7 @@ initialize_telemetry(
 )
 
 # Create and use agent
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools()
@@ -214,7 +221,7 @@ Set `enabled=False` or don't initialize telemetry at all. The agent will work no
 
 ```python
 # Option 1: Don't initialize
-# agent = create_gemma_agent(...)  # No tracing
+# agent = Agent(...)  # No tracing
 
 # Option 2: Explicitly disable
 initialize_telemetry(enabled=False)
@@ -301,7 +308,7 @@ Use the `@trace_method` decorator:
 from linus.agents.telemetry import trace_method
 
 class MyAgent(ReasoningAgent):
-    @trace_method("my_agent.custom_method", custom_attr="value")
+    @trace_method("agent.custom_method", custom_attr="value")
     def my_custom_method(self, data: str) -> str:
         # Method body
         return "result"

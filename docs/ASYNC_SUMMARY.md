@@ -87,10 +87,10 @@ Complete documentation covering:
 
 ```python
 import asyncio
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
 async def main():
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
 
     # Use arun() instead of run()
     result = await agent.arun("Calculate 42 * 17", return_metrics=True)
@@ -105,7 +105,7 @@ asyncio.run(main())
 
 ```python
 async def parallel_agents():
-    agents = [create_gemma_agent(tools=tools) for _ in range(3)]
+    agents = [Agent(tools=tools) for _ in range(3)]
 
     # Execute all in parallel
     results = await asyncio.gather(
@@ -225,10 +225,10 @@ await asyncio.gather(*tasks, return_exceptions=True)
 
 ```python
 from fastapi import FastAPI
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
 app = FastAPI()
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 @app.post("/agent/query")
 async def query_agent(query: str):

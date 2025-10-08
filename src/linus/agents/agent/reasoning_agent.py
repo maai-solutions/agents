@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from loguru import logger
 from openai import OpenAI, AsyncOpenAI
 
+from linus.agents.agent.memory import MemoryManager
+
 from .base import Agent
 from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse
 from .tool_base import BaseTool
@@ -46,12 +48,14 @@ class ReasoningAgent(Agent):
         output_key: Optional[str] = None,
         state: Optional[SharedState] = None,
         max_iterations: int = 10,
-        memory_manager: Optional['MemoryManager'] = None,
+        memory_manager: Optional[MemoryManager] = None,
         memory_context_ratio: float = 0.3,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        api_base: Optional[str] = None,
+        use_json_format: bool = False
     ):
         """Initialize the reasoning agent.
 
@@ -71,6 +75,8 @@ class ReasoningAgent(Agent):
             max_tokens: Maximum tokens to generate in completion
             top_p: Nucleus sampling parameter
             top_k: Top-k sampling parameter
+            api_base: Optional API base URL for reference
+            use_json_format: Whether to use response_format={"type": "json_object"} (not all models support this)
         """
         super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
         self.reasoning_prompt = self._create_reasoning_prompt()
@@ -85,6 +91,8 @@ class ReasoningAgent(Agent):
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.top_k = top_k
+        self.api_base = api_base
+        self.use_json_format = use_json_format
 
         # Telemetry tracer
         self.tracer = get_tracer()
@@ -129,9 +137,11 @@ Your task is to analyze the user's request and determine:
 2. What specific steps/tasks need to be performed
 3. Which tools (if any) are needed for each step
 
+IMPORTANT: You must respond with ONLY valid JSON. Do not include any text before or after the JSON.
+
 Respond in the following JSON format:
 {{
-    "has_sufficient_info": true/false,
+    "has_sufficient_info": true,
     "reasoning": "Your analysis of the request",
     "tasks": [
         {{
@@ -146,21 +156,27 @@ User request: """
 
     def _create_execution_prompt(self) -> str:
         """Create the prompt template for the execution phase."""
-        return """You are an AI assistant that generates tool arguments.
+        return """You are an AI assistant that generates tool arguments in JSON format.
 
 Given a task and a tool, generate the appropriate arguments for the tool call.
 
 Tool: {tool_name}
 Tool Description: {tool_description}
-Tool Parameters: {tool_parameters}
+Tool Parameters Schema: {tool_parameters}
 
 Task: {task_description}
 Context: {context}
 
-Respond with ONLY a valid JSON object containing the tool arguments.
-Example: {{"query": "search term", "limit": 10}}
+CRITICAL INSTRUCTIONS:
+1. Respond with ONLY a valid JSON object containing the tool arguments
+2. Do NOT include any explanatory text before or after the JSON
+3. Do NOT use markdown code blocks (no ```json or ```)
+4. Match the exact parameter names from the schema
+5. Use appropriate data types (strings, numbers, booleans, objects, arrays)
 
-Tool arguments:"""
+Example format: {{"query": "search term", "limit": 10}}
+
+Generate the JSON tool arguments now:"""
 
     def _create_completion_check_prompt(self) -> str:
         """Create the prompt template for checking task completion."""
@@ -193,13 +209,20 @@ Response:"""
         Returns:
             AgentResponse (if return_metrics=True) or just the result (if return_metrics=False)
         """
+        # Validate and convert input
+        input_text = self._validate_and_convert_input(input_data)
+
+        # Start tracing for agent run
+        with self.tracer.trace_agent_run(user_input=input_text, agent_type="ReasoningAgent") as trace:
+            return self._run_with_trace(input_text, return_metrics, trace)
+
+    def _run_with_trace(self, input_text: str, return_metrics: bool, trace: Any = None) -> Union[str, BaseModel, AgentResponse]:
+        """Internal run method with tracing support."""
         # Initialize metrics
         metrics = AgentMetrics()
         self.current_metrics = metrics
         start_time = time.time()
 
-        # Validate and convert input
-        input_text = self._validate_and_convert_input(input_data)
         logger.info(f"[RUN] Starting task: {input_text}")
 
         # Store user input in memory
@@ -329,6 +352,22 @@ Response:"""
 
         # Format output according to schema and save to state
         formatted_result = self._format_output(final_result)
+
+        # Update trace with final output and status
+        if trace and hasattr(trace, 'update'):
+            trace.update(
+                output=str(formatted_result)[:1000],
+                level="DEFAULT" if is_complete else "WARNING",
+                metadata={
+                    "completed": is_complete,
+                    "iterations": iteration,
+                    "execution_time": metrics.execution_time_seconds
+                }
+            )
+
+        # Flush traces to ensure they're sent to Langfuse
+        if hasattr(self.tracer, 'flush'):
+            self.tracer.flush()
 
         # Store agent response in memory
         if self.memory_manager:
@@ -570,11 +609,45 @@ Response:"""
         self.tracer.set_attribute("llm.input", input_text[:500])
         self.tracer.set_attribute("llm.model", self.model)
 
-        response = self.llm.chat.completions.create(
-            messages=messages,
-            **self._get_generation_kwargs()
-        )
-        response_text = response.choices[0].message.content
+        # Try to force JSON response format if supported
+        gen_kwargs = self._get_generation_kwargs()
+
+        logger.debug(f"[REASONING] params: {json.dumps(gen_kwargs, indent=2)}")
+
+        # Add response_format for models that support it (OpenAI, some others)
+        if self.use_json_format:
+            try:
+                gen_kwargs["response_format"] = {"type": "json_object"}
+                logger.debug("[REASONING] Using response_format=json_object")
+            except Exception:
+                pass  # Some models don't support this parameter
+
+        # Trace LLM call
+        with self.tracer.trace_llm_call(
+            prompt=f"{self.reasoning_prompt}\n\nUser: {input_text}",
+            model=self.model,
+            call_type="reasoning"
+        ) as llm_span:
+            response = self.llm.chat.completions.create(
+                **gen_kwargs,
+                messages=messages,
+            )
+            response_text = response.choices[0].message.content
+
+            # Update Langfuse generation with output and usage
+            if hasattr(self.tracer, 'update_generation') and hasattr(llm_span, 'update'):
+                usage_dict = None
+                if hasattr(response, 'usage') and response.usage:
+                    usage_dict = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    }
+                    llm_span.update(
+                        output=response_text,
+                        usage=usage_dict
+                    )
+
         logger.debug(f"[REASONING] Raw response: {response_text}")
 
         # Record LLM output
@@ -602,13 +675,13 @@ Response:"""
             logger.debug(f"[REASONING] Parsed result: {result}")
             return result
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[REASONING] Error parsing response: {e}")
-            logger.debug(f"[REASONING] Failed to parse: {response_text}")
+            logger.exception(f"[REASONING] Error parsing response: {e}")
+            logger.error(f"[REASONING] Raw response was: {response_text[:500]}")
             # Fallback: treat as insufficient info
             return ReasoningResult(
                 has_sufficient_info=False,
                 tasks=[],
-                reasoning="Failed to parse reasoning response"
+                reasoning=f"Failed to parse reasoning response. Model returned: {response_text[:200]}"
             )
     
     @trace_method("agent.execute_task")
@@ -656,7 +729,17 @@ Response:"""
             if self.current_metrics:
                 self.current_metrics.tool_executions += 1
 
-            result = tool.run(tool_args)
+            # Trace tool execution
+            with self.tracer.trace_tool_execution(
+                tool_name=task.tool_name,
+                tool_args=tool_args
+            ) as tool_span:
+                result = tool.run(tool_args)
+
+                # Update tool span with result
+                if hasattr(tool_span, 'update'):
+                    tool_span.update(output={"result": str(result)[:500]})
+
             logger.debug(f"[EXECUTION] Tool result: {result}")
 
             # Add telemetry for tool result
@@ -670,7 +753,7 @@ Response:"""
 
             return str(result)
         except Exception as e:
-            logger.error(f"[EXECUTION] Error executing tool {task.tool_name}: {e}")
+            logger.exception(f"[EXECUTION] Error executing tool {task.tool_name}: {e}")
 
             # Track failed tool call
             if self.current_metrics:
@@ -693,7 +776,7 @@ Response:"""
         tool_params = {}
         if hasattr(tool, 'args_schema') and tool.args_schema:
             # Extract parameters from Pydantic model
-            tool_params = tool.args_schema.schema()
+            tool_params = tool.args_schema.model_json_schema()
         
         prompt = self.execution_prompt.format(
             tool_name=tool.name,
@@ -712,9 +795,13 @@ Response:"""
             {"role": "user", "content": prompt}
         ]
 
+        # Use lower temperature for more consistent JSON generation
+        kwargs = self._get_generation_kwargs()
+        kwargs["temperature"] = min(0.3, kwargs.get("temperature", 0.7))
+
         response = self.llm.chat.completions.create(
             messages=messages,
-            **self._get_generation_kwargs()
+            **kwargs
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[TOOL_ARGS] Raw response: {response_text}")
@@ -723,19 +810,28 @@ Response:"""
         self._update_token_usage(response)
 
         try:
-            # Parse JSON arguments
-            # Extract JSON from the response
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                args = json.loads(json_match.group())
+            # Parse JSON arguments with multiple fallback strategies
+            args = None
+
+            # Strategy 1: Try to extract JSON from markdown code blocks
+            code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if code_block_match:
+                logger.debug(f"[TOOL_ARGS] Found JSON in markdown code block")
+                args = json.loads(code_block_match.group(1))
             else:
-                args = json.loads(response_text)
+                # Strategy 2: Extract first JSON object from response
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    args = json.loads(json_match.group())
+                else:
+                    # Strategy 3: Try parsing the entire response as JSON
+                    args = json.loads(response_text.strip())
 
             logger.debug(f"[TOOL_ARGS] Parsed arguments: {args}")
             return args
         except json.JSONDecodeError as e:
-            logger.error(f"[TOOL_ARGS] Error parsing tool arguments: {e}")
-            logger.debug(f"[TOOL_ARGS] Failed to parse: {response_text}")
+            logger.exception(f"[TOOL_ARGS] Error parsing tool arguments: {e}")
+            logger.error(f"[TOOL_ARGS] Failed to parse response: {response_text}")
             return None
     
     def _generate_response(self, task_description: str, context: str) -> str:
@@ -837,7 +933,7 @@ Response:"""
             return result
 
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[COMPLETION_CHECK] Error parsing completion check: {e}")
+            logger.exception(f"[COMPLETION_CHECK] Error parsing completion check: {e}")
             # Conservative fallback: assume incomplete
             return {
                 "is_complete": False,
@@ -964,10 +1060,20 @@ Response:"""
 
         logger.debug(f"[ASYNC-REASONING] Input text: {input_text}")
 
+        # Try to force JSON response format if supported
+        gen_kwargs = self._get_generation_kwargs()
+
+        # Add response_format for models that support it
+        if self.use_json_format:
+            try:
+                gen_kwargs["response_format"] = {"type": "json_object"}
+                logger.debug("[ASYNC-REASONING] Using response_format=json_object")
+            except Exception:
+                pass
+
         response = await self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **gen_kwargs
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[ASYNC-REASONING] Raw response: {response_text}")
@@ -994,11 +1100,12 @@ Response:"""
             logger.debug(f"[ASYNC-REASONING] Parsed result: {result}")
             return result
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[ASYNC-REASONING] Error parsing response: {e}")
+            logger.exception(f"[ASYNC-REASONING] Error parsing response: {e}")
+            logger.error(f"[ASYNC-REASONING] Raw response was: {response_text[:500]}")
             return ReasoningResult(
                 has_sufficient_info=False,
                 tasks=[],
-                reasoning="Failed to parse reasoning response"
+                reasoning=f"Failed to parse reasoning response. Model returned: {response_text[:200]}"
             )
 
     async def _aexecute_task_with_tool(self, task: TaskExecution, context: str) -> str:
@@ -1047,7 +1154,7 @@ Response:"""
 
             return str(result)
         except Exception as e:
-            logger.error(f"[ASYNC-EXECUTION] Tool execution failed: {e}")
+            logger.exception(f"[ASYNC-EXECUTION] Tool execution failed: {e}")
             task.completed = False
             if self.current_metrics:
                 self.current_metrics.tool_executions += 1
@@ -1077,35 +1184,48 @@ Response:"""
         )
 
         messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": "Generate the arguments for this tool call."}
+            {"role": "system", "content": "You are a helpful assistant that generates tool arguments."},
+            {"role": "user", "content": prompt}
         ]
 
         logger.debug(f"[ASYNC-TOOL-ARGS] Generating args for {tool.name}")
 
+        # Use lower temperature for more consistent JSON generation
+        kwargs = self._get_generation_kwargs()
+        kwargs["temperature"] = min(0.3, kwargs.get("temperature", 0.7))
+
         response = await self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **kwargs
         )
 
         # Track metrics
         self._update_token_usage(response)
 
         try:
-            # Extract JSON from response
+            # Parse JSON arguments with multiple fallback strategies
             response_text = response.choices[0].message.content
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                args = json.loads(json_match.group())
+            args = None
+
+            # Strategy 1: Try to extract JSON from markdown code blocks
+            code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if code_block_match:
+                logger.debug(f"[ASYNC-TOOL-ARGS] Found JSON in markdown code block")
+                args = json.loads(code_block_match.group(1))
             else:
-                args = json.loads(response_text)
+                # Strategy 2: Extract first JSON object from response
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    args = json.loads(json_match.group())
+                else:
+                    # Strategy 3: Try parsing the entire response as JSON
+                    args = json.loads(response_text.strip())
 
             logger.debug(f"[ASYNC-TOOL-ARGS] Generated args: {args}")
             return args
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[ASYNC-TOOL-ARGS] Error parsing arguments: {e}")
-            logger.debug(f"[ASYNC-TOOL-ARGS] Failed to parse: {response.content}")
+            logger.exception(f"[ASYNC-TOOL-ARGS] Error parsing arguments: {e}")
+            logger.error(f"[ASYNC-TOOL-ARGS] Failed to parse response: {response_text}")
             return None
 
     async def _agenerate_response(self, task_description: str, context: str) -> str:
@@ -1187,7 +1307,7 @@ Response:"""
             logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
             return completion_status
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
+            logger.exception(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
             # Default to continuing if we can't parse
             return {
                 "is_complete": False,

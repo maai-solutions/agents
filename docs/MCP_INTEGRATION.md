@@ -29,7 +29,7 @@ pip install mcp
 ```python
 import asyncio
 from linus.agents.agent import (
-    create_gemma_agent,
+    Agent,
     MCPServerConfig,
     connect_mcp_servers
 )
@@ -47,7 +47,7 @@ async def main():
     mcp_tools = await connect_mcp_servers(servers)
 
     # Create agent with MCP tools
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         tools=mcp_tools
@@ -224,7 +224,7 @@ Wrapper class that adapts MCP tools to agent tools.
 import asyncio
 import os
 from linus.agents.agent import (
-    create_gemma_agent,
+    Agent,
     MCPServerConfig,
     connect_mcp_servers,
     get_default_tools
@@ -258,7 +258,7 @@ async def multi_server_example():
     all_tools = get_default_tools() + mcp_tools
 
     # Create agent
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         api_key="not-needed",
@@ -345,7 +345,7 @@ MCP servers require async/await:
 # Correct
 async def main():
     tools = await connect_mcp_servers(servers)
-    agent = create_gemma_agent(tools=tools)
+    agent = Agent(tools=tools)
     result = agent.run("query")  # agent.run() is sync
 
 asyncio.run(main())

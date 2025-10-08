@@ -6,7 +6,7 @@ import asyncio
 import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor, SharedState
 from loguru import logger
@@ -19,7 +19,7 @@ async def example_async_agent():
     print("="*80)
 
     tools = get_default_tools()
-    agent = create_gemma_agent(
+    agent = Agent(
         tools=tools,
         verbose=False,
         max_iterations=3
@@ -50,9 +50,9 @@ async def example_parallel_agents():
     tools = get_default_tools()
 
     # Create multiple agents
-    agent1 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    agent2 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    agent3 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
+    agent1 = Agent(tools=tools, verbose=False, max_iterations=2)
+    agent2 = Agent(tools=tools, verbose=False, max_iterations=2)
+    agent3 = Agent(tools=tools, verbose=False, max_iterations=2)
 
     # Define tasks
     tasks = [
@@ -83,9 +83,9 @@ async def example_async_dag_sequential():
     tools = get_default_tools()
 
     # Create agents
-    agent1 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    agent2 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    agent3 = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
+    agent1 = Agent(tools=tools, verbose=False, max_iterations=2)
+    agent2 = Agent(tools=tools, verbose=False, max_iterations=2)
+    agent3 = Agent(tools=tools, verbose=False, max_iterations=2)
 
     # Build DAG: agent1 -> agent2 -> agent3
     dag = AgentDAG(name="SequentialPipeline")
@@ -129,10 +129,10 @@ async def example_async_dag_parallel():
     tools = get_default_tools()
 
     # Create agents for parallel processing
-    ingestion = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    stats = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    patterns = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
-    report = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
+    ingestion = Agent(tools=tools, verbose=False, max_iterations=2)
+    stats = Agent(tools=tools, verbose=False, max_iterations=2)
+    patterns = Agent(tools=tools, verbose=False, max_iterations=2)
+    report = Agent(tools=tools, verbose=False, max_iterations=2)
 
     # Build DAG with parallel processing
     #          ┌→ stats ┐
@@ -191,7 +191,7 @@ async def example_performance_comparison():
 
         # Create 3 parallel branches
         for i in range(3):
-            agent = create_gemma_agent(tools=tools, verbose=False, max_iterations=2)
+            agent = Agent(tools=tools, verbose=False, max_iterations=2)
             dag.add_node(AgentNode(name=f"task{i}", agent=agent, output_key=f"result{i}"))
 
         return dag
@@ -269,7 +269,7 @@ async def main():
         print("="*80)
 
     except Exception as e:
-        logger.error(f"Example failed: {e}", exc_info=True)
+        logger.exception(f"Example failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

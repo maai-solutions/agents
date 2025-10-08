@@ -25,7 +25,7 @@ The agent now runs in a loop, continuously reasoning and executing until the tas
 
 **Configuration:**
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     max_iterations=10  # Maximum loop iterations
 )
@@ -238,11 +238,11 @@ class AgentResponse:
 
 ### Basic Usage
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 tools = get_default_tools()
-agent = create_gemma_agent(tools=tools, max_iterations=10)
+agent = Agent(tools=tools, max_iterations=10)
 
 response = agent.run("Calculate 42 * 17 and search for its significance")
 
@@ -331,7 +331,7 @@ print(f"Estimated cost: ${total_cost:.4f}")
 ## Configuration Options
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=tools,

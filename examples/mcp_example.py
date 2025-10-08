@@ -26,7 +26,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from linus.agents.agent import (
-    create_gemma_agent,
+    Agent,
     MCPServerConfig,
     connect_mcp_servers,
     is_mcp_available,
@@ -88,7 +88,7 @@ async def main():
 
         # Create agent with all tools
         print("\n🤖 Creating agent with MCP tools...")
-        agent = create_gemma_agent(
+        agent = Agent(
             api_base="http://localhost:11434/v1",
             model="gemma3:27b",
             api_key="not-needed",
@@ -160,7 +160,7 @@ async def simple_example():
     mcp_tools = await connect_mcp_servers(servers)
 
     # Create agent
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",
         model="gemma3:27b",
         api_key="not-needed",

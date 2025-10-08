@@ -1,7 +1,7 @@
 """Example usage of the ReasoningAgent with Gemma3:27b."""
 
 import os
-from src.linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
+from src.linus.agents.agent.agent import ReasoningAgent, Agent
 from src.linus.agents.agent.tools import get_default_tools, create_custom_tool
 from langchain.chat_models import ChatOpenAI
 from pydantic import BaseModel, Field
@@ -38,7 +38,7 @@ def main():
     
     # Create agent for Gemma3:27b
     # Assuming Ollama is running with Gemma3:27b model
-    agent = create_gemma_agent(
+    agent = Agent(
         api_base="http://localhost:11434/v1",  # Ollama OpenAI-compatible endpoint
         model="gemma3:27b",  # or "gemma2:27b" depending on your setup
         tools=tools,

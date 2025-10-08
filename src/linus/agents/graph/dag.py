@@ -41,7 +41,7 @@ class Edge:
         try:
             return self.condition(state)
         except Exception as e:
-            logger.error(f"[EDGE] Condition error {self.from_node}->{self.to_node}: {e}")
+            logger.exception(f"[EDGE] Condition error {self.from_node}->{self.to_node}: {e}")
             return False
 
 
@@ -135,7 +135,7 @@ class AgentNode:
             self.error = str(e)
             self.end_time = datetime.now()
 
-            logger.error(f"[NODE:{self.name}] Error: {e}")
+            logger.exception(f"[NODE:{self.name}] Error: {e}")
 
             # Handle error based on configuration
             if self.on_error == "fail":
@@ -531,7 +531,7 @@ class DAGExecutor:
                     try:
                         node.execute(self.state)
                     except Exception as e:
-                        logger.error(f"[EXECUTOR] Node {node_name} failed: {e}")
+                        logger.exception(f"[EXECUTOR] Node {node_name} failed: {e}")
                         if node.status != NodeStatus.SKIPPED:
                             node.status = NodeStatus.FAILED
 
@@ -738,7 +738,7 @@ class DAGExecutor:
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, node.execute, self.state)
             except Exception as e:
-                logger.error(f"[ASYNC-EXECUTOR] Node {node_name} failed: {e}")
+                logger.exception(f"[ASYNC-EXECUTOR] Node {node_name} failed: {e}")
                 if node.status != NodeStatus.SKIPPED:
                     node.status = NodeStatus.FAILED
 
@@ -784,7 +784,7 @@ class DAGExecutor:
             logger.info(f"[ASYNC-EXECUTOR] Node '{node.name}' completed (async)")
 
         except Exception as e:
-            logger.error(f"[ASYNC-EXECUTOR] Node '{node.name}' failed: {e}", exc_info=True)
+            logger.exception(f"[ASYNC-EXECUTOR] Node '{node.name}' failed: {e}", exc_info=True)
             node.status = NodeStatus.FAILED
             node.error = str(e)
 

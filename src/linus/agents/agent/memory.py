@@ -306,7 +306,7 @@ class MemoryManager:
             logger.debug(f"[MEMORY] Summary: {self.summary[:200]}...")
 
         except Exception as e:
-            logger.error(f"[MEMORY] Failed to create summary: {e}")
+            logger.exception(f"[MEMORY] Failed to create summary: {e}")
 
     def get_context(
         self,

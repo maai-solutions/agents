@@ -22,7 +22,7 @@ from linus.agents.graph import AgentNode
 
 node = AgentNode(
     name="data_processor",
-    agent=my_agent,
+    agent=agent,
     description="Process incoming data",
     input_mapping={"data": "raw_data"},  # Map state keys to agent input
     output_key="processed_data",         # Where to store output
@@ -113,15 +113,15 @@ result = executor.execute(initial_state={"input": "data"})
 
 ```python
 from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor
-from linus.agents.agent.agent import create_gemma_agent
-from linus.agents.agent.tools import get_default_tools
+from linus.agents.agent import Agent
+from linus.agents.agent import get_default_tools
 
 tools = get_default_tools()
 
 # Create agents
-agent1 = create_gemma_agent(tools=tools)
-agent2 = create_gemma_agent(tools=tools)
-agent3 = create_gemma_agent(tools=tools)
+agent1 = Agent(tools=tools)
+agent2 = Agent(tools=tools)
+agent3 = Agent(tools=tools)
 
 # Build DAG
 dag = AgentDAG(name="LinearFlow")

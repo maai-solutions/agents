@@ -64,13 +64,13 @@ Memory Flow:
 ### Basic Usage with Memory
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 tools = get_default_tools()
 
 # Create agent with memory enabled
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     enable_memory=True,
     max_context_tokens=4096,      # Context window size
@@ -91,7 +91,7 @@ response2 = agent.run("What was the previous calculation?")
 ### Memory Configuration Options
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,              # Enable/disable memory
     memory_backend="in_memory",      # "in_memory" or "vector_store"
     max_context_tokens=4096,         # Total context window
@@ -247,7 +247,7 @@ memory_mgr = MemoryManager(
 ### Example 1: Multi-Turn Conversation
 
 ```python
-agent = create_gemma_agent(enable_memory=True, tools=tools)
+agent = Agent(enable_memory=True, tools=tools)
 
 # Turn 1
 agent.run("My name is Alice")
@@ -265,7 +265,7 @@ agent.run("What was the calculation result?")  # Should remember "15"
 ### Example 2: Long Conversation with Summarization
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=2048,
     memory_context_ratio=0.4
@@ -285,7 +285,7 @@ for i in range(30):
 
 ```python
 # Session 1: Create memories
-agent1 = create_gemma_agent(enable_memory=True, tools=tools)
+agent1 = Agent(enable_memory=True, tools=tools)
 agent1.run("I like Python programming")
 agent1.run("My favorite number is 42")
 
@@ -295,7 +295,7 @@ with open('memories.json', 'w') as f:
     json.dump(exported, f)
 
 # Session 2: Restore memories
-agent2 = create_gemma_agent(enable_memory=True, tools=tools)
+agent2 = Agent(enable_memory=True, tools=tools)
 with open('memories.json', 'r') as f:
     imported = json.load(f)
 agent2.memory_manager.import_memories(imported)
@@ -307,7 +307,7 @@ response = agent2.run("What's my favorite number?")  # Should say 42
 ### Example 4: Custom Memory Entries
 
 ```python
-agent = create_gemma_agent(enable_memory=True, tools=tools)
+agent = Agent(enable_memory=True, tools=tools)
 
 # Add high-importance system information
 agent.memory_manager.add_memory(
@@ -350,7 +350,7 @@ stats = agent.memory_manager.get_memory_stats()
 
 ```python
 # For Gemma3:27b (8K context)
-agent = create_gemma_agent(
+agent = Agent(
     max_context_tokens=6000,  # Leave headroom
     memory_context_ratio=0.25  # 25% for memory
 )

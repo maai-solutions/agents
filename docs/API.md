@@ -22,12 +22,12 @@ Complete API documentation for creating and using agents with tools, memory, and
 ### Basic Agent (Ollama)
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 # Create agent with Ollama
 tools = get_default_tools()
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -45,7 +45,7 @@ print(result)
 ### With OpenAI
 
 ```python
-agent = create_gemma_agent(
+agent = Agent(
     api_base="https://api.openai.com/v1",
     model="gpt-4",
     api_key="sk-your-api-key",
@@ -192,12 +192,12 @@ response = agent.run("Calculate 10 + 5", return_metrics=True)
 
 ## Agent Creation
 
-### create_gemma_agent()
+### Agent()
 
 Factory function to create a pre-configured ReasoningAgent for OpenAI-compatible APIs.
 
 ```python
-def create_gemma_agent(
+def Agent(
     api_base: str = "http://localhost:11434/v1",
     model: str = "gemma3:27b",
     api_key: str = "not-needed",
@@ -252,11 +252,11 @@ def create_gemma_agent(
 **Examples:**
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools
 
 # Ollama agent with custom parameters
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -267,7 +267,7 @@ agent = create_gemma_agent(
 )
 
 # OpenAI agent
-agent = create_gemma_agent(
+agent = Agent(
     api_base="https://api.openai.com/v1",
     model="gpt-4",
     api_key="sk-your-key",
@@ -279,7 +279,7 @@ agent = create_gemma_agent(
 )
 
 # Async agent
-agent = create_gemma_agent(
+agent = Agent(
     model="gemma3:27b",
     use_async=True,
     tools=get_default_tools()
@@ -305,11 +305,11 @@ Both state types are **fully compatible** - agents can use either transparently 
 Traditional dictionary state for simple use cases.
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
 # Create agent with dict state
 state = {"user_id": 123, "session": "abc"}
-agent = create_gemma_agent(tools=tools, state=state)
+agent = Agent(tools=tools, state=state)
 
 # Access state
 agent.state["user_id"]  # 123
@@ -323,7 +323,7 @@ agent.state["new_key"] = "value"
 Advanced state system with metadata, history, and multi-agent coordination.
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.graph.state import SharedState
 
 # Create shared state
@@ -331,7 +331,7 @@ shared_state = SharedState()
 shared_state.set("user_id", 123, source="init", metadata={"priority": "high"})
 
 # Create agent with SharedState
-agent = create_gemma_agent(tools=tools, state=shared_state)
+agent = Agent(tools=tools, state=shared_state)
 
 # Agent automatically wraps SharedState - all dict operations work
 agent.state["user_id"]  # 123
@@ -353,8 +353,8 @@ from linus.agents.graph.state import SharedState
 shared_state = SharedState()
 
 # Create multiple agents with same state
-agent1 = create_gemma_agent(tools=tools, state=shared_state)
-agent2 = create_gemma_agent(tools=tools, state=shared_state)
+agent1 = Agent(tools=tools, state=shared_state)
+agent2 = Agent(tools=tools, state=shared_state)
 
 # Agent 1 sets data
 agent1.state["result_from_agent1"] = "analysis complete"
@@ -421,8 +421,8 @@ from linus.agents.graph import AgentDAG, AgentNode, DAGExecutor, SharedState
 state = SharedState()
 
 # Create agents that share state
-analyzer = create_gemma_agent(tools=tools, state=state, output_key="analysis")
-processor = create_gemma_agent(tools=tools, state=state, output_key="processed")
+analyzer = Agent(tools=tools, state=state, output_key="analysis")
+processor = Agent(tools=tools, state=state, output_key="processed")
 
 # Build DAG
 dag = AgentDAG("Pipeline")
@@ -568,7 +568,7 @@ class WeatherTool(BaseTool):
 
 # Use the tool
 weather_tool = WeatherTool()
-agent = create_gemma_agent(tools=[weather_tool])
+agent = Agent(tools=[weather_tool])
 ```
 
 #### Example 2: Tool with Complex Input
@@ -1058,7 +1058,7 @@ class CustomAPITool(BaseTool):
 
 # Usage
 tool = CustomAPITool(base_url="https://api.example.com", api_key="key")
-agent = create_gemma_agent(tools=[tool])
+agent = Agent(tools=[tool])
 ```
 
 ### Creating a Custom Memory Backend
@@ -1156,7 +1156,7 @@ class TaskOutput(BaseModel):
     recommendations: Optional[List[str]] = Field(default=None)
 
 # Create agent with schemas
-agent = create_gemma_agent(
+agent = Agent(
     tools=tools,
     input_schema=TaskInput,
     output_schema=TaskOutput
@@ -1184,7 +1184,7 @@ if isinstance(response.result, TaskOutput):
 ### Multi-Agent System with Memory
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 from linus.agents.agent.tools import get_default_tools, create_custom_tool
 from linus.agents.agent.memory import create_memory_manager
 
@@ -1210,14 +1210,14 @@ shared_memory = create_memory_manager(
 )
 
 # Create specialized agents
-data_agent = create_gemma_agent(
+data_agent = Agent(
     tools=tools,
     enable_memory=True,
     max_context_tokens=6000,
     memory_context_ratio=0.2
 )
 
-report_agent = create_gemma_agent(
+report_agent = Agent(
     tools=tools,
     enable_memory=True,
     max_context_tokens=6000,
@@ -1252,9 +1252,9 @@ print(f"Total tokens used: {total_tokens}")
 ## Error Handling
 
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
-agent = create_gemma_agent(tools=tools)
+agent = Agent(tools=tools)
 
 try:
     response = agent.run("Complex task", return_metrics=True)
@@ -1297,7 +1297,7 @@ class BadTool(BaseTool):
 
 ```python
 # ✅ Good: Appropriate settings for use case
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=6000,      # Leave headroom
     memory_context_ratio=0.3,     # Balanced
@@ -1305,7 +1305,7 @@ agent = create_gemma_agent(
 )
 
 # ❌ Bad: Will cause context overflow
-agent = create_gemma_agent(
+agent = Agent(
     enable_memory=True,
     max_context_tokens=100000,    # Too large!
     memory_context_ratio=0.9,     # Too much for memory

@@ -15,7 +15,7 @@ from linus.agents.logging_config import (
     log_metrics,
     log_tree
 )
-from linus.agents.agent import create_gemma_agent, get_default_tools
+from linus.agents.agent import Agent, get_default_tools
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -71,7 +71,7 @@ def main():
         ]
         log_with_table(tools_data, title="🛠️  Available Tools", console=console)
 
-        agent = create_gemma_agent(
+        agent = Agent(
             api_base=os.getenv("LLM_API_BASE", "http://localhost:11434/v1"),
             model=os.getenv("LLM_MODEL", "gemma3:27b"),
             tools=tools,

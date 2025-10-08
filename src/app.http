@@ -1,0 +1,95 @@
+### ROOT
+GET http://localhost:8000/
+
+### HEALTH
+GET http://localhost:8000/health
+
+### TEST
+GET http://localhost:8000/test/scenarios
+
+### LIST TOOLS
+GET http://localhost:8000/tools
+
+### HISTORY
+GET http://localhost:8000/history?session_id=abc
+
+### HISTORY DELETE
+DELETE http://localhost:8000/history?session_id=abc
+
+### TEST REASONING
+POST http://localhost:8000/agent/reasoning
+Content-Type: application/json
+
+{
+    "query": "I want to calculate 2 multiplied by the current month as number",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}
+
+### TEST QUERY
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "I want to calculate 2 multiplied by the current month as number. Return only the result and nothing else. No explanation.",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}
+
+### TEST REASONING WITH VECTOR STORE
+POST http://localhost:8000/agent/reasoning
+Content-Type: application/json
+
+{
+    "query": "I want to know the current situation in Ukraine, the status of the conflict with Russia and the impact on Europe economy",
+    "tools": true,
+    "stream": false,
+    "session_id": "bcd"
+}
+
+### TEST QUERY WITH VECTOR STORE
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "I want to know the current situation in Ukraine, the status of the conflict with Russia and the impact on Europe economy",
+    "tools": true,
+    "stream": false,
+    "session_id": "bcd"
+}
+
+
+### TEST REASONING WITH VECTOR STORE
+POST http://localhost:8000/agent/reasoning
+Content-Type: application/json
+
+{
+    "query": "why are the whales in danger",
+    "tools": true,
+    "stream": false,
+    "session_id": "bcd"
+}
+
+### TEST QUERY WITH VECTOR STORE
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "why are the whales in danger?",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}
+
+### TEST QUERY WITH ENTITIES SEARCH
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "There is currently a conflict between Russia and Ukraine. I want to know which cities are involved",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}

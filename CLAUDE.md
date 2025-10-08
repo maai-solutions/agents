@@ -53,6 +53,8 @@ python example_rich_logging.py
 
 ### Configuration
 Environment variables are configured in `.env`:
+
+**LLM Configuration:**
 - `LLM_API_BASE`: OpenAI-compatible API endpoint (default: `http://localhost:11434/v1`)
 - `LLM_MODEL`: Model name (default: `gemma3:27b`)
 - `LLM_API_KEY`: API key for authentication (default: `not-needed` for Ollama)
@@ -61,6 +63,15 @@ Environment variables are configured in `.env`:
 - `LLM_TOP_P`: Nucleus sampling parameter (optional)
 - `LLM_TOP_K`: Top-k sampling parameter (optional, Ollama-specific)
 - `AGENT_VERBOSE`: Enable debug logging (default: `true`)
+
+**Observability Configuration (Langfuse is the default):**
+- `TELEMETRY_ENABLED`: Enable/disable telemetry (default: `true`)
+- `TELEMETRY_EXPORTER`: Exporter type - `langfuse`, `console`, `otlp`, `jaeger` (default: `langfuse`)
+- `LANGFUSE_PUBLIC_KEY`: Langfuse public API key (required for Langfuse)
+- `LANGFUSE_SECRET_KEY`: Langfuse secret API key (required for Langfuse)
+- `LANGFUSE_HOST`: Langfuse host URL (default: `https://cloud.langfuse.com`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OpenTelemetry OTLP endpoint (default: `http://localhost:4317`)
+- `JAEGER_AGENT_HOST`: Jaeger agent host (default: `localhost`)
 
 ## Architecture
 
@@ -94,6 +105,14 @@ Environment variables are configured in `.env`:
 - `log_tree()`: Display nested data as a tree structure
 - Rich integration provides colored output, syntax highlighting, and enhanced tracebacks
 - See [docs/RICH_LOGGING.md](docs/RICH_LOGGING.md) for detailed guide
+
+**Telemetry** (`src/linus/agents/telemetry.py`):
+- `initialize_telemetry()`: Setup observability (OpenTelemetry or Langfuse)
+- `AgentTracer`: OpenTelemetry wrapper for agent operations
+- `LangfuseTracer`: Langfuse wrapper for LLM observability
+- Supports: Console, OTLP, Jaeger, and Langfuse exporters
+- Traces: Agent runs, reasoning phases, LLM calls, tool executions
+- See [docs/TELEMETRY.md](docs/TELEMETRY.md) and [docs/LANGFUSE_INTEGRATION.md](docs/LANGFUSE_INTEGRATION.md)
 
 **FastAPI Application** (`src/app.py`):
 - `/agent/query`: Main endpoint for agent queries
@@ -261,3 +280,61 @@ response = await agent.arun("Calculate 100 + 200")
 ```
 
 To get just the result string: `agent.run(query, return_metrics=False)`
+
+### Using Langfuse for Observability
+
+Langfuse provides LLM-specific observability with automatic tracking of prompts, completions, tokens, and costs:
+
+```python
+from linus.agents.telemetry import initialize_telemetry
+
+# Initialize Langfuse tracer
+tracer = initialize_telemetry(
+    service_name="my-agent",
+    exporter_type="langfuse",  # Use Langfuse
+    enabled=True
+)
+
+# Create agent with Langfuse tracing
+agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    tools=get_default_tools(),
+    tracer=tracer  # Pass tracer to agent
+)
+
+# Run queries - automatically traced in Langfuse
+response = agent.run("What is 42 * 17?")
+
+# Flush traces before exit
+tracer.flush()
+```
+
+**With Session ID for monitoring sessions:**
+```python
+# Initialize Langfuse tracer with session ID
+tracer = initialize_telemetry(
+    service_name="my-agent",
+    exporter_type="langfuse",
+    session_id="user-123-session-456",  # Group traces by session
+    enabled=True
+)
+
+# Or set session_id directly on agent
+agent = create_gemma_agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    tools=get_default_tools(),
+    session_id="user-123-session-456"  # Automatically creates Langfuse tracer with session
+)
+
+# All traces from this agent will be grouped under the same session
+response = agent.run("What is 42 * 17?")
+```
+
+**Environment variables required:**
+- `LANGFUSE_PUBLIC_KEY`: Your Langfuse public API key
+- `LANGFUSE_SECRET_KEY`: Your Langfuse secret API key
+- `LANGFUSE_HOST`: Langfuse host (default: `https://cloud.langfuse.com`)
+
+See [docs/LANGFUSE_INTEGRATION.md](docs/LANGFUSE_INTEGRATION.md) for detailed setup and usage.

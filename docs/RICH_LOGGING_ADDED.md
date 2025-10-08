@@ -127,9 +127,9 @@ log_metrics({
 
 ### Agent with Rich Output
 ```python
-from linus.agents.agent import create_gemma_agent
+from linus.agents.agent import Agent
 
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools(),
