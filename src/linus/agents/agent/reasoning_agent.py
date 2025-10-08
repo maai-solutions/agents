@@ -126,16 +126,23 @@ class ReasoningAgent(Agent):
             f"- {tool.name}: {tool.description}"
             for tool in self.tools
         ])
-        
+
         return f"""You are an AI assistant that helps plan and execute tasks.
 
 Available tools:
 {tool_descriptions}
 
 Your task is to analyze the user's request and determine:
-1. Whether you have enough information to complete the task
+1. Whether you have enough information to attempt the task
 2. What specific steps/tasks need to be performed
 3. Which tools (if any) are needed for each step
+
+IMPORTANT GUIDELINES:
+- Set "has_sufficient_info" to true if you can ATTEMPT the task, even if success is uncertain
+- Only set "has_sufficient_info" to false if the request is completely unclear or missing critical parameters that cannot be inferred
+- If a tool might not return results, plan alternative tools or approaches in subsequent tasks
+- When previous tools returned no results, plan different tools or different queries
+- Be persistent and creative in planning alternative approaches
 
 IMPORTANT: You must respond with ONLY valid JSON. Do not include any text before or after the JSON.
 
@@ -188,6 +195,12 @@ Execution History:
 {execution_history}
 
 Based on the original request and the execution history, determine if the task has been completed successfully.
+
+IMPORTANT GUIDELINES:
+- If a tool returned no results or empty data, the task is NOT complete unless all reasonable alternatives have been tried
+- Suggest trying alternative tools or different query approaches when tools return no results
+- Only mark as complete when the user's request has been successfully answered or when all reasonable attempts have been exhausted
+- Be persistent: if one approach didn't work, plan to try another approach rather than giving up
 
 Respond in the following JSON format:
 {{
@@ -276,10 +289,18 @@ Response:"""
             reasoning_result = self._reasoning_call(context)
             logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
 
-            if not reasoning_result.has_sufficient_info:
+            # If no sufficient info and this is the first iteration, exit early
+            # But allow retries in subsequent iterations with updated context
+            if not reasoning_result.has_sufficient_info and iteration == 1:
                 result = f"I need more information to complete this task. {reasoning_result.reasoning}"
                 logger.warning(f"[RUN] Insufficient information: {reasoning_result.reasoning}")
-                return self._format_output(result)
+
+                # Return immediately only if there are no tasks planned
+                if not reasoning_result.tasks:
+                    return self._format_output(result)
+
+                # If there are tasks planned, continue to execute them
+                logger.info(f"[RUN] Proceeding with {len(reasoning_result.tasks)} planned tasks despite insufficient info flag")
 
             # Phase 2: Execute planned tasks
             iteration_results = []
@@ -364,6 +385,9 @@ Response:"""
                     "execution_time": metrics.execution_time_seconds
                 }
             )
+
+        # Record metrics in telemetry
+        self.tracer.record_metrics(metrics.to_dict())
 
         # Flush traces to ensure they're sent to Langfuse
         if hasattr(self.tracer, 'flush'):
@@ -474,10 +498,18 @@ Response:"""
             reasoning_result = await self._areasoning_call(context)
             logger.debug(f"[ARUN] Reasoning result: {reasoning_result}")
 
-            if not reasoning_result.has_sufficient_info:
+            # If no sufficient info and this is the first iteration, exit early
+            # But allow retries in subsequent iterations with updated context
+            if not reasoning_result.has_sufficient_info and iteration == 1:
                 result = f"I need more information to complete this task. {reasoning_result.reasoning}"
                 logger.warning(f"[ARUN] Insufficient information: {reasoning_result.reasoning}")
-                return self._format_output(result)
+
+                # Return immediately only if there are no tasks planned
+                if not reasoning_result.tasks:
+                    return self._format_output(result)
+
+                # If there are tasks planned, continue to execute them
+                logger.info(f"[ARUN] Proceeding with {len(reasoning_result.tasks)} planned tasks despite insufficient info flag")
 
             # Phase 2: Execute planned tasks
             iteration_results = []

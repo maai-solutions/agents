@@ -295,7 +295,7 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         )
         
         # Store in conversation history
-        conversation_history.append(response.dict())
+        conversation_history.append(response.model_dump())
         
         # Limit history size
         if len(conversation_history) > 100:

@@ -93,3 +93,14 @@ Content-Type: application/json
     "stream": false,
     "session_id": "abc"
 }
+
+### TEST QUERY WITH ENTITIES SEARCH
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "There is currently a conflict between Russia and Ukraine. I want to know which people and organizations are involved",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}

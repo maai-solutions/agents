@@ -10,14 +10,14 @@ from linus.settings.settings import Settings
 
 
 class EntitiesSearchInput(BaseModel):
-    """Input for the vector store search tool."""
-    query: str = Field(description="The search query")
+    """Input for the entities search tool."""
+    query: str = Field(description="Entity type or name to search for (e.g., 'people', 'organizations', 'John Smith', 'Microsoft')")
 
 class EntitiesSearchTool(BaseTool):
-    """Tool for searching entities using Weaviate vector store with keywords search."""
+    """Tool for searching and extracting named entities (people, organizations, locations) from Weaviate."""
 
     name: str = "entities_search"
-    description: str = "Search for entities like people, organization, locations etc, using keyword search"
+    description: str = "Extract named entities (person names, organizations, locations, etc.) from the knowledge base. Use this when you need to find WHO, WHAT organization, or WHERE. Returns only entity tags, not full text content."
     args_schema: Type[BaseModel] = EntitiesSearchInput
 
     def __init__(self):
@@ -109,16 +109,16 @@ class EntitiesSearchTool(BaseTool):
             for idx, obj in enumerate(response.objects, 1):
                 score = obj.metadata.score
                 tags = obj.properties.get('tags', '')
-                tags = json.loads(tags)
+                tags = json.loads(tags) if tags else []
 
                 result_str = f"{idx}. [Score: {score:.4f}]\n"
-                result_str += f"Tags: {json.dumps(tags, indent=2)}\n"
+                result_str += f"   Entities: {json.dumps(tags, indent=2)}\n"
                 results.append(result_str)
 
             if not results:
-                return f"No results found for query '{query}' within max_distance {max_distance}"
+                return f"No entities found for query '{query}' within max_distance {_max_distance}"
 
-            header = f"Hybrid search results for '{query}' (alpha={alpha}, limit={limit}, max_distance={max_distance}):\n\n"
+            header = f"Entity search results for '{query}' (alpha={_alpha}, limit={_limit}, max_distance={_max_distance}):\n\n"
             return header + "\n".join(results)
 
         except Exception as e:

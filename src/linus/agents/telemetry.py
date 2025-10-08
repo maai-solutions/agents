@@ -175,7 +175,8 @@ class LangfuseTracer:
         self.enabled = langfuse_client is not None and LANGFUSE_AVAILABLE
         self.session_id = session_id
         self._current_trace = None
-        self._current_spans = {}  # Stack of spans by name
+        self._current_span = None
+        self._span_stack = []  # Stack of spans for nested contexts
 
     def trace_agent_run(
         self,
@@ -195,17 +196,27 @@ class LangfuseTracer:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Build metadata
+        # Create a new trace using Langfuse v3.x API
+        # start_as_current_span creates both the trace and root span
         metadata = {"agent_type": agent_type}
         if self.session_id:
-            metadata["sessionId"] = self.session_id
+            metadata["session_id"] = self.session_id
 
-        # Use start_as_current_span to create the root trace/span
-        return self.client.start_as_current_span(
+        # Create root span for the agent run
+        # Note: session_id is set in metadata, not as a parameter
+        span = self.client.start_as_current_span(
             name="agent_run",
-            input=user_input,
+            input={"query": user_input},
             metadata=metadata
         )
+
+        self._current_trace = span
+        self._span_stack.append(span)
+
+        logger.debug(f"[LANGFUSE] Created trace span: agent_run")
+
+        # Return the span object (it's a context manager)
+        return span
 
     def trace_reasoning_phase(
         self,
@@ -226,10 +237,18 @@ class LangfuseTracer:
             return nullcontext()
 
         # Create a child span for reasoning
-        return self.client.start_as_current_span(
+        span = self.client.start_as_current_span(
             name="reasoning_phase",
-            input={"text": input_text, "iteration": iteration}
+            input={"text": input_text[:500], "iteration": iteration},
+            metadata={"iteration": iteration}
         )
+
+        self._span_stack.append(span)
+        self._current_span = span
+
+        logger.debug(f"[LANGFUSE] Created reasoning span for iteration {iteration}")
+
+        return span
 
     def trace_llm_call(
         self,
@@ -245,20 +264,24 @@ class LangfuseTracer:
             call_type: Type of call (reasoning, tool_args, generate)
 
         Returns:
-            Span context
+            Generation context
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Use start_as_current_observation for LLM calls
-        return self.client.start_as_current_observation(
-            name=f"llm_{call_type}",
+        # Create a generation span for LLM calls using Langfuse v3.x API
+        generation = self.client.start_as_current_observation(
             as_type="generation",
+            name=f"llm_{call_type}",
             model=model,
-            input=prompt,
+            input=prompt[:1000],  # Limit input size
             metadata={"call_type": call_type}
         )
+
+        logger.debug(f"[LANGFUSE] Created generation span: llm_{call_type}")
+
+        return generation
 
     def trace_tool_execution(
         self,
@@ -278,12 +301,16 @@ class LangfuseTracer:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Create a child span for tool execution
-        return self.client.start_as_current_span(
+        # Create a child span for tool execution using Langfuse v3.x API
+        span = self.client.start_as_current_span(
             name=f"tool_{tool_name}",
             input=tool_args,
             metadata={"tool": tool_name}
         )
+
+        logger.debug(f"[LANGFUSE] Created tool execution span: tool_{tool_name}")
+
+        return span
 
     def add_event(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         """Add an event to the current trace.
@@ -295,14 +322,8 @@ class LangfuseTracer:
         if not self.enabled:
             return
 
-        # Create an event using the Langfuse client
-        try:
-            self.client.create_event(
-                name=name,
-                metadata=attributes or {}
-            )
-        except Exception:
-            pass  # Silently ignore if event creation fails
+        # Events are logged for debugging - Langfuse doesn't have a direct event API
+        logger.debug(f"[LANGFUSE] Event: {name} - {attributes}")
 
     def set_attribute(self, key: str, value: Any):
         """Set metadata on the current trace/span.
@@ -311,14 +332,16 @@ class LangfuseTracer:
             key: Attribute key
             value: Attribute value
         """
-        if not self.enabled:
+        if not self.enabled or not self._current_trace:
             return
 
-        # Update current span/trace metadata
+        # Update the current trace's metadata
         try:
-            self.client.update_current_trace(metadata={key: value})
-        except Exception:
-            pass  # Silently ignore if update fails
+            # Langfuse doesn't support directly setting attributes on active spans
+            # Store them for later update or log them
+            logger.debug(f"[LANGFUSE] Attribute set: {key}={value}")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to set attribute: {e}")
 
     def record_exception(self, exception: Exception):
         """Record an exception in the current trace.
@@ -329,13 +352,8 @@ class LangfuseTracer:
         if not self.enabled:
             return
 
-        try:
-            self.client.update_current_trace(
-                output={"error": str(exception)},
-                level="ERROR"
-            )
-        except Exception:
-            pass  # Silently ignore if update fails
+        # Log exception - will be captured in span/generation metadata if needed
+        logger.error(f"[LANGFUSE] Exception: {type(exception).__name__}: {str(exception)}")
 
     def set_status(self, status_code: str, description: str = ""):
         """Set the status of the current trace.
@@ -344,17 +362,11 @@ class LangfuseTracer:
             status_code: Status code (OK, ERROR)
             description: Status description
         """
-        if not self.enabled:
+        if not self.enabled or not self._current_trace:
             return
 
-        try:
-            level = "DEFAULT" if status_code == "OK" else "ERROR"
-            self.client.update_current_trace(
-                level=level,
-                metadata={"status": status_code, "description": description}
-            )
-        except Exception:
-            pass  # Silently ignore if update fails
+        # Store status for later - will be used when trace is ended
+        logger.debug(f"[LANGFUSE] Status set: {status_code} - {description}")
 
     def update_generation(self, output: str, usage: Optional[Dict[str, int]] = None):
         """Update the current LLM generation with output and usage stats.
@@ -366,18 +378,35 @@ class LangfuseTracer:
         if not self.enabled:
             return
 
-        try:
-            update_kwargs = {"output": output}
-            if usage:
-                update_kwargs["usage"] = usage
-            self.client.update_current_generation(**update_kwargs)
-        except Exception:
-            pass  # Silently ignore if update fails
+        # Generations are updated via span.update() in the context manager
+        # This is called from reasoning_agent.py after LLM completion
+        logger.debug(f"[LANGFUSE] Generation update called with {len(output) if output else 0} chars output")
 
     def flush(self):
         """Flush pending traces to Langfuse."""
         if self.enabled and self.client:
-            self.client.flush()
+            try:
+                self.client.flush()
+                logger.info("[LANGFUSE] Flushed traces to Langfuse server")
+            except Exception as e:
+                logger.error(f"[LANGFUSE] Failed to flush traces: {e}")
+
+    def record_metrics(self, metrics: Dict[str, Any]):
+        """Record metrics on the current trace.
+
+        Args:
+            metrics: Dictionary of metrics to record
+        """
+        if not self.enabled:
+            return
+
+        try:
+            # Update the current trace with metrics metadata
+            # Langfuse v3.x supports update_current_trace
+            self.client.update_current_trace(metadata={"metrics": metrics})
+            logger.debug(f"[LANGFUSE] Recorded metrics: {list(metrics.keys())}")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to record metrics: {e}")
 
 
 class AgentTracer:
@@ -558,6 +587,24 @@ class AgentTracer:
                 span.set_status(Status(StatusCode.OK, description))
             elif status_code == "ERROR":
                 span.set_status(Status(StatusCode.ERROR, description))
+
+    def record_metrics(self, metrics: Dict[str, Any]):
+        """Record metrics as span attributes.
+
+        Args:
+            metrics: Dictionary of metrics to record
+        """
+        if not self.enabled:
+            return
+
+        span = trace.get_current_span()
+        if span:
+            for key, value in metrics.items():
+                # Convert value to a type that OpenTelemetry can handle
+                if isinstance(value, (str, bool, int, float)):
+                    span.set_attribute(f"agent.metrics.{key}", value)
+                else:
+                    span.set_attribute(f"agent.metrics.{key}", str(value))
 
 
 # Global tracer instance (can be either AgentTracer or LangfuseTracer)

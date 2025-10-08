@@ -10,13 +10,13 @@ from linus.settings.settings import Settings
 
 class VectorStoreInput(BaseModel):
     """Input for the vector store search tool."""
-    query: str = Field(description="The search query")
+    query: str = Field(description="Natural language question or topic to search for in document content")
 
 class VectorStoreTool(BaseTool):
-    """Tool for searching information using Weaviate vector store with hybrid search."""
+    """Tool for searching document content/chunks using Weaviate vector store with hybrid search."""
 
     name: str = "vector_search"
-    description: str = "Search for information using hybrid vector and keyword search"
+    description: str = "Search for information in document content and text chunks. Use this to find WHAT was said, written, or documented about a topic. Returns full text content/paragraphs, not just entity names."
     args_schema: Type[BaseModel] = VectorStoreInput
 
     def __init__(self):
@@ -108,18 +108,18 @@ class VectorStoreTool(BaseTool):
             for idx, obj in enumerate(response.objects, 1):
                 score = obj.metadata.score
                 content = obj.properties.get('text', '') or obj.properties.get('content', '')
-                metadata = {k: v for k, v in obj.properties.items() if k not in ['text', 'content']}
+                metadata = {k: v for k, v in obj.properties.items() if k not in ['text', 'content', 'tags']}
 
                 result_str = f"{idx}. [Score: {score:.4f}]\n"
-                result_str += f"Content: {content}\n"
+                result_str += f"   Content: {content[:500]}{'...' if len(content) > 500 else ''}\n"
                 if metadata:
                     result_str += f"   Metadata: {metadata}\n"
                 results.append(result_str)
 
             if not results:
-                return f"No results found for query '{query}' within max_distance {max_distance}"
+                return f"No content found for query '{query}' within max_distance {_max_distance}"
 
-            header = f"Hybrid search results for '{query}' (alpha={alpha}, limit={limit}, max_distance={max_distance}):\n\n"
+            header = f"Content search results for '{query}' (alpha={_alpha}, limit={_limit}, max_distance={_max_distance}):\n\n"
             return header + "\n".join(results)
 
         except Exception as e:
