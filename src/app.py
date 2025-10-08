@@ -81,7 +81,7 @@ class AgentRequest(BaseModel):
 
 class AgentResponse(BaseModel):
     """Response model for agent interactions."""
-    
+
     query: str
     response: str
     reasoning: Optional[Dict[str, Any]] = None
@@ -89,6 +89,7 @@ class AgentResponse(BaseModel):
     execution_time: float
     timestamp: str
     session_id: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
 
 
 class ToolTestRequest(BaseModel):
@@ -199,36 +200,53 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
     try:
         # Run the agent (this is synchronous, so we run it in a thread pool)
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, agent.run, request.query)
-        
+        agent_response = await loop.run_in_executor(None, agent.run, request.query)
+
         execution_time = (datetime.now() - start_time).total_seconds()
-        
-        # Extract reasoning information if available
-        reasoning = None
-        if hasattr(agent, '_last_reasoning_result'):
-            reasoning = {
-                "has_sufficient_info": agent._last_reasoning_result.has_sufficient_info,
-                "reasoning": agent._last_reasoning_result.reasoning,
-                "tasks": agent._last_reasoning_result.tasks
-            }
-        
-        # Track which tools were used
-        tools_used = []
-        if reasoning and reasoning.get("tasks"):
-            tools_used = [
-                task.get("tool_name") 
-                for task in reasoning["tasks"] 
-                if task.get("tool_name")
-            ]
-        
+
+        # Handle AgentResponse from agent.run (returns AgentResponse by default with return_metrics=True)
+        from linus.agents.agent.agent import AgentResponse as AgentResponseData
+
+        if isinstance(agent_response, AgentResponseData):
+            # Extract the result string from AgentResponse
+            result_text = str(agent_response.result)
+
+            # Extract tools used from execution history
+            tools_used = []
+            if agent_response.execution_history:
+                tools_used = [
+                    item.get("tool")
+                    for item in agent_response.execution_history
+                    if item.get("tool")
+                ]
+
+            # Build reasoning info from execution history
+            reasoning = None
+            if agent_response.execution_history:
+                reasoning = {
+                    "completion_status": agent_response.completion_status,
+                    "iterations": agent_response.metrics.total_iterations,
+                    "execution_history": agent_response.execution_history
+                }
+
+            # Extract metrics
+            metrics = agent_response.metrics.to_dict() if agent_response.metrics else None
+        else:
+            # Fallback for string response
+            result_text = str(agent_response)
+            tools_used = []
+            reasoning = None
+            metrics = None
+
         response = AgentResponse(
             query=request.query,
-            response=result,
+            response=result_text,
             reasoning=reasoning,
-            tools_used=tools_used,
+            tools_used=list(set(tools_used)),  # Remove duplicates
             execution_time=execution_time,
             timestamp=datetime.now().isoformat(),
-            session_id=request.session_id
+            session_id=request.session_id,
+            metrics=metrics
         )
         
         # Store in conversation history
@@ -365,19 +383,27 @@ async def clear_history():
 async def batch_queries(queries: List[str]):
     """Process multiple queries in batch."""
     global agent
-    
+
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
+    from linus.agents.agent.agent import AgentResponse as AgentResponseData
     results = []
-    
+
     for query in queries:
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, agent.run, query)
+            agent_response = await loop.run_in_executor(None, agent.run, query)
+
+            # Extract string result from AgentResponse
+            if isinstance(agent_response, AgentResponseData):
+                result_text = str(agent_response.result)
+            else:
+                result_text = str(agent_response)
+
             results.append({
                 "query": query,
-                "response": result,
+                "response": result_text,
                 "status": "success"
             })
         except Exception as e:
@@ -386,7 +412,7 @@ async def batch_queries(queries: List[str]):
                 "error": str(e),
                 "status": "failed"
             })
-    
+
     return {"results": results}
 
 
@@ -395,32 +421,41 @@ async def batch_queries(queries: List[str]):
 async def test_scenarios():
     """Run predefined test scenarios."""
     global agent
-    
+
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
+    from linus.agents.agent.agent import AgentResponse as AgentResponseData
+
     scenarios = [
         "What is the current time?",
         "Calculate 42 * 17 + 256",
         "Search for information about FastAPI",
         "First get the current time, then calculate 100/4, and finally search for Python"
     ]
-    
+
     results = []
     for scenario in scenarios:
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, agent.run, scenario)
+            agent_response = await loop.run_in_executor(None, agent.run, scenario)
+
+            # Extract string result from AgentResponse
+            if isinstance(agent_response, AgentResponseData):
+                result_text = str(agent_response.result)
+            else:
+                result_text = str(agent_response)
+
             results.append({
                 "scenario": scenario,
-                "result": result[:200] + "..." if len(result) > 200 else result
+                "result": result_text[:200] + "..." if len(result_text) > 200 else result_text
             })
         except Exception as e:
             results.append({
                 "scenario": scenario,
                 "error": str(e)
             })
-    
+
     return {"test_results": results}
 
 

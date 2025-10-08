@@ -18,8 +18,7 @@ A complete framework for building sophisticated AI agent systems with memory, me
 - ✅ **Conditional Execution** - Dynamic routing based on state
 - ✅ **Parallel Planning** - Automatic detection of parallelizable tasks
 - ✅ **Error Recovery** - Configurable error handling per node
-- ✅ **State Sharing** - Shared state between all agents
-- ✅ **State Compatibility** - Seamless integration between dict and SharedState
+- ✅ **Unified State Management** - SharedState with metadata, history, and multi-agent coordination
 - ✅ **Visualization** - Built-in DAG visualization for debugging
 
 ## 📦 Installation
@@ -99,6 +98,7 @@ print(f"Report: {result.final_state['final_report']}")
 
 ### Feature-Specific
 - **[ASYNC.md](ASYNC.md)** - Async/await and parallel execution
+- **[STATE_UNIFIED.md](STATE_UNIFIED.md)** - Unified SharedState management
 - **[MEMORY.md](MEMORY.md)** - Memory system guide
 - **[METRICS.md](METRICS.md)** - Metrics tracking
 - **[DAG.md](DAG.md)** - DAG orchestration guide

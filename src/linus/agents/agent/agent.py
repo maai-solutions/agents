@@ -6,9 +6,8 @@ import json
 import re
 import time
 import asyncio
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from openai import AsyncOpenAI, OpenAI
 from langchain_core.tools import BaseTool
-from langchain_community.chat_models import ChatOpenAI
 from pydantic import BaseModel, Field
 from loguru import logger
 
@@ -20,73 +19,8 @@ except ImportError:
     MEMORY_AVAILABLE = False
     logger.warning("Memory module not available")
 
-# Import graph components for state compatibility
-try:
-    from ..graph.state import SharedState
-    GRAPH_STATE_AVAILABLE = True
-except ImportError:
-    GRAPH_STATE_AVAILABLE = False
-    SharedState = None
-
-
-class StateWrapper:
-    """Wrapper to provide dict-like interface to SharedState.
-
-    This allows agents to use SharedState transparently while maintaining
-    backward compatibility with code that expects a dict-like state object.
-    """
-
-    def __init__(self, shared_state: 'SharedState'):
-        """Initialize wrapper with SharedState instance.
-
-        Args:
-            shared_state: The SharedState instance to wrap
-        """
-        self._shared_state = shared_state
-
-    def __getitem__(self, key: str) -> Any:
-        """Get item using dict syntax: state[key]."""
-        value = self._shared_state.get(key)
-        if value is None:
-            raise KeyError(f"Key '{key}' not found in state")
-        return value
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        """Set item using dict syntax: state[key] = value."""
-        self._shared_state.set(key, value, source="agent")
-
-    def __contains__(self, key: str) -> bool:
-        """Check if key exists using 'in' operator."""
-        return self._shared_state.get(key) is not None
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get value with default fallback."""
-        return self._shared_state.get(key, default=default)
-
-    def keys(self) -> List[str]:
-        """Get all keys in state."""
-        return list(self._shared_state.get_all().keys())
-
-    def values(self) -> List[Any]:
-        """Get all values in state."""
-        return list(self._shared_state.get_all().values())
-
-    def items(self) -> List[Tuple[str, Any]]:
-        """Get all key-value pairs."""
-        return list(self._shared_state.get_all().items())
-
-    def update(self, other: Dict[str, Any]) -> None:
-        """Update state with dict values."""
-        for key, value in other.items():
-            self._shared_state.set(key, value, source="agent")
-
-    def __repr__(self) -> str:
-        """String representation."""
-        return f"StateWrapper({self._shared_state.get_all()})"
-
-    def __len__(self) -> int:
-        """Return number of items in state."""
-        return len(self._shared_state.get_all())
+# Import SharedState from graph module
+from ..graph.state import SharedState
 
 
 @dataclass
@@ -168,32 +102,35 @@ class AgentResponse:
 
 
 class Agent:
-    """Base Agent class with langchain integration."""
+    """Base Agent class with OpenAI client integration."""
 
     def __init__(
         self,
-        llm: ChatOpenAI,
+        llm: Union[AsyncOpenAI, OpenAI],
+        model: str,
         tools: List[BaseTool],
         verbose: bool = False,
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+        state: Optional[SharedState] = None,
         memory_manager: Optional['MemoryManager'] = None
     ):
         """Initialize the base agent.
 
         Args:
-            llm: LangChain ChatOpenAI instance (can be configured for Gemma)
+            llm: OpenAI client instance (AsyncOpenAI or OpenAI)
+            model: Model name to use (e.g., "gemma3:27b")
             tools: List of available tools
             verbose: Whether to print debug information
             input_schema: Optional Pydantic BaseModel for structured input validation
             output_schema: Optional Pydantic BaseModel for structured output
             output_key: Optional key to save output in shared state
-            state: Optional shared state (dict or SharedState from graph module)
+            state: Optional SharedState instance for state management
             memory_manager: Optional memory manager for context persistence
         """
         self.llm = llm
+        self.model = model
         self.tools = tools
         self.tool_map = {tool.name: tool for tool in tools}
         self.verbose = verbose
@@ -201,16 +138,8 @@ class Agent:
         self.output_schema = output_schema
         self.output_key = output_key
 
-        # Handle both dict and SharedState
-        if state is None:
-            self.state = {}
-            self._shared_state = None
-        elif GRAPH_STATE_AVAILABLE and isinstance(state, SharedState):
-            self._shared_state = state
-            self.state = StateWrapper(state)  # Wrapper for backward compatibility
-        else:
-            self.state = state
-            self._shared_state = None
+        # Use SharedState directly
+        self.state = state or SharedState()
 
         self.memory_manager = memory_manager
 
@@ -277,7 +206,7 @@ class Agent:
 
                 # Save to state if output_key is provided
                 if self.output_key:
-                    self.state[self.output_key] = output_obj
+                    self.state.set(self.output_key, output_obj, source="agent")
                     self._log(f"Saved output to state['{self.output_key}']")
 
                 return output_obj
@@ -285,12 +214,12 @@ class Agent:
                 self._log(f"Error parsing output with schema: {e}")
                 # Fall back to string result
                 if self.output_key:
-                    self.state[self.output_key] = result
+                    self.state.set(self.output_key, result, source="agent")
                 return result
 
         # No output schema, save raw result if output_key is provided
         if self.output_key:
-            self.state[self.output_key] = result
+            self.state.set(self.output_key, result, source="agent")
             self._log(f"Saved output to state['{self.output_key}']")
 
         return result
@@ -301,29 +230,28 @@ class Agent:
             logger.info(message)
 
     def _update_token_usage(self, response: Any):
-        """Extract and update token usage from LLM response.
+        """Extract and update token usage from OpenAI response.
 
         Args:
-            response: The response from the LLM call
+            response: The response from the OpenAI API call
         """
         if self.current_metrics is None:
             return
 
         self.current_metrics.llm_calls += 1
 
-        # Try to extract token usage from response
+        # Extract token usage from OpenAI response
         try:
-            if hasattr(response, 'response_metadata'):
-                metadata = response.response_metadata
-                if 'token_usage' in metadata:
-                    usage = metadata['token_usage']
-                    self.current_metrics.total_input_tokens += usage.get('prompt_tokens', 0)
-                    self.current_metrics.total_output_tokens += usage.get('completion_tokens', 0)
-                    self.current_metrics.total_tokens += usage.get('total_tokens', 0)
-            # Fallback: estimate tokens if metadata not available
-            elif hasattr(response, 'content'):
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                self.current_metrics.total_input_tokens += getattr(usage, 'prompt_tokens', 0)
+                self.current_metrics.total_output_tokens += getattr(usage, 'completion_tokens', 0)
+                self.current_metrics.total_tokens += getattr(usage, 'total_tokens', 0)
+            # Fallback: estimate tokens if usage not available
+            elif hasattr(response, 'choices') and len(response.choices) > 0:
+                content = response.choices[0].message.content
                 # Rough estimation: ~4 characters per token
-                estimated_tokens = len(response.content) // 4
+                estimated_tokens = len(content) // 4 if content else 0
                 self.current_metrics.total_output_tokens += estimated_tokens
                 self.current_metrics.total_tokens += estimated_tokens
         except Exception as e:
@@ -339,13 +267,14 @@ class ReasoningAgent(Agent):
 
     def __init__(
         self,
-        llm: ChatOpenAI,
+        llm: Union[AsyncOpenAI, OpenAI],
+        model: str,
         tools: List[BaseTool],
         verbose: bool = False,
         input_schema: Optional[Type[BaseModel]] = None,
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
-        state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+        state: Optional[SharedState] = None,
         max_iterations: int = 10,
         memory_manager: Optional['MemoryManager'] = None,
         memory_context_ratio: float = 0.3
@@ -353,18 +282,19 @@ class ReasoningAgent(Agent):
         """Initialize the reasoning agent.
 
         Args:
-            llm: LangChain ChatOpenAI instance
+            llm: OpenAI client instance (AsyncOpenAI or OpenAI)
+            model: Model name to use (e.g., "gemma3:27b")
             tools: List of available tools
             verbose: Whether to print debug information
             input_schema: Optional Pydantic BaseModel for structured input validation
             output_schema: Optional Pydantic BaseModel for structured output
             output_key: Optional key to save output in shared state
-            state: Optional shared state (dict or SharedState from graph module)
+            state: Optional SharedState instance for state management
             max_iterations: Maximum number of reasoning-execution loops before stopping
             memory_manager: Optional memory manager for context persistence
             memory_context_ratio: Ratio of context window to use for memory (0.0 to 1.0)
         """
-        super().__init__(llm, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
+        super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
         self.reasoning_prompt = self._create_reasoning_prompt()
         self.execution_prompt = self._create_execution_prompt()
         self.completion_check_prompt = self._create_completion_check_prompt()
@@ -498,8 +428,10 @@ Response:"""
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
                     logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
 
-            if self.state:
-                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in self.state.items()})}"
+            # Add state context if available
+            state_data = self.state.get_all()
+            if state_data:
+                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in state_data.items()})}"
                 context = context + state_context
 
             if execution_history:
@@ -675,8 +607,10 @@ Response:"""
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
                     logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
 
-            if self.state:
-                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in self.state.items()})}"
+            # Add state context if available
+            state_data = self.state.get_all()
+            if state_data:
+                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in state_data.items()})}"
                 context = context + state_context
 
             if execution_history:
@@ -806,19 +740,22 @@ Response:"""
         Returns:
             ReasoningResult containing the analysis and planned tasks
         """
-        prompt = self.reasoning_prompt + input_text
-
         messages = [
-            SystemMessage(content=self.reasoning_prompt),
-            HumanMessage(content=input_text)
+            {"role": "system", "content": self.reasoning_prompt},
+            {"role": "user", "content": input_text}
         ]
 
         logger.debug(f"[REASONING] Input text: {input_text}")
         logger.debug(f"[REASONING] System prompt: {self.reasoning_prompt}")
         logger.debug(f"[REASONING] Messages: {messages}")
 
-        response = self.llm.invoke(messages)
-        logger.debug(f"[REASONING] Raw response: {response.content}")
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[REASONING] Raw response: {response_text}")
 
         # Track metrics
         if self.current_metrics:
@@ -827,14 +764,13 @@ Response:"""
 
         try:
             # Parse JSON response
-            response_text = response.content
             # Extract JSON from the response (in case there's extra text)
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 response_data = json.loads(json_match.group())
             else:
                 response_data = json.loads(response_text)
-            
+
             result = ReasoningResult(
                 has_sufficient_info=response_data.get("has_sufficient_info", False),
                 tasks=response_data.get("tasks", []),
@@ -844,7 +780,7 @@ Response:"""
             return result
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"[REASONING] Error parsing response: {e}")
-            logger.debug(f"[REASONING] Failed to parse: {response.content}")
+            logger.debug(f"[REASONING] Failed to parse: {response_text}")
             # Fallback: treat as insufficient info
             return ReasoningResult(
                 has_sufficient_info=False,
@@ -936,19 +872,23 @@ Response:"""
         logger.debug(f"[TOOL_ARGS] Prompt: {prompt}")
 
         messages = [
-            SystemMessage(content="You are a helpful assistant that generates tool arguments."),
-            HumanMessage(content=prompt)
+            {"role": "system", "content": "You are a helpful assistant that generates tool arguments."},
+            {"role": "user", "content": prompt}
         ]
 
-        response = self.llm.invoke(messages)
-        logger.debug(f"[TOOL_ARGS] Raw response: {response.content}")
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[TOOL_ARGS] Raw response: {response_text}")
 
         # Track metrics
         self._update_token_usage(response)
 
         try:
             # Parse JSON arguments
-            response_text = response.content
             # Extract JSON from the response
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -977,17 +917,22 @@ Response:"""
         logger.debug(f"[GENERATE] Context: {context}")
 
         messages = [
-            SystemMessage(content="You are a helpful assistant."),
-            HumanMessage(content=f"Context: {context}\n\nTask: {task_description}")
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Context: {context}\n\nTask: {task_description}"}
         ]
 
-        response = self.llm.invoke(messages)
-        logger.debug(f"[GENERATE] Response: {response.content}")
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[GENERATE] Response: {response_text}")
 
         # Track metrics
         self._update_token_usage(response)
 
-        return response.content
+        return response_text
     
     def _check_completion(self, original_request: str, execution_history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Check if the task has been completed successfully.
@@ -1020,15 +965,20 @@ Response:"""
         )
 
         messages = [
-            SystemMessage(content="You are a task completion validator."),
-            HumanMessage(content=prompt)
+            {"role": "system", "content": "You are a task completion validator."},
+            {"role": "user", "content": prompt}
         ]
 
         logger.debug(f"[COMPLETION_CHECK] Checking completion for: {original_request}")
         logger.debug(f"[COMPLETION_CHECK] History: {history_text[:500]}")
 
-        response = self.llm.invoke(messages)
-        logger.debug(f"[COMPLETION_CHECK] Raw response: {response.content}")
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[COMPLETION_CHECK] Raw response: {response_text}")
 
         # Track metrics
         if self.current_metrics:
@@ -1037,7 +987,6 @@ Response:"""
 
         try:
             # Parse JSON response
-            response_text = response.content
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 completion_data = json.loads(json_match.group())
@@ -1098,16 +1047,20 @@ Response:"""
 
             # Use LLM to create a coherent final response
             messages = [
-                SystemMessage(content="Summarize the following task execution history into a clear, coherent final answer to the user's original request."),
-                HumanMessage(content=f"Original request: {original_request}\n\nExecution history:\n{combined}\n\nProvide a concise final answer:")
+                {"role": "system", "content": "Summarize the following task execution history into a clear, coherent final answer to the user's original request."},
+                {"role": "user", "content": f"Original request: {original_request}\n\nExecution history:\n{combined}\n\nProvide a concise final answer:"}
             ]
 
-            response = self.llm.invoke(messages)
+            response = self.llm.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.7
+            )
 
             # Track metrics
             self._update_token_usage(response)
 
-            final_answer = response.content
+            final_answer = response.choices[0].message.content
 
         # Add completion status if not complete
         if not completion_status["is_complete"]:
@@ -1144,17 +1097,22 @@ Response:"""
 
         # Use LLM to create a coherent final response
         messages = [
-            SystemMessage(content="Summarize the following task results into a coherent response."),
-            HumanMessage(content=f"Original request: {original_request}\n\nResults:\n{combined}")
+            {"role": "system", "content": "Summarize the following task results into a coherent response."},
+            {"role": "user", "content": f"Original request: {original_request}\n\nResults:\n{combined}"}
         ]
 
-        response = self.llm.invoke(messages)
-        logger.debug(f"[FINAL] Final response: {response.content}")
+        response = self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[FINAL] Final response: {response_text}")
 
         # Track metrics
         self._update_token_usage(response)
 
-        return response.content
+        return response_text
 
     # ===== ASYNC VERSIONS OF HELPER METHODS =====
 
@@ -1168,14 +1126,19 @@ Response:"""
             ReasoningResult containing the analysis and planned tasks
         """
         messages = [
-            SystemMessage(content=self.reasoning_prompt),
-            HumanMessage(content=input_text)
+            {"role": "system", "content": self.reasoning_prompt},
+            {"role": "user", "content": input_text}
         ]
 
         logger.debug(f"[ASYNC-REASONING] Input text: {input_text}")
 
-        response = await self.llm.ainvoke(messages)
-        logger.debug(f"[ASYNC-REASONING] Raw response: {response.content}")
+        response = await self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
+        response_text = response.choices[0].message.content
+        logger.debug(f"[ASYNC-REASONING] Raw response: {response_text}")
 
         # Track metrics
         if self.current_metrics:
@@ -1184,7 +1147,6 @@ Response:"""
 
         try:
             # Parse JSON response
-            response_text = response.content
             # Extract JSON from the response (in case there's extra text)
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -1283,20 +1245,24 @@ Response:"""
         )
 
         messages = [
-            SystemMessage(content=prompt),
-            HumanMessage(content=f"Generate the arguments for this tool call.")
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Generate the arguments for this tool call."}
         ]
 
         logger.debug(f"[ASYNC-TOOL-ARGS] Generating args for {tool.name}")
 
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
 
         # Track metrics
         self._update_token_usage(response)
 
         try:
             # Extract JSON from response
-            response_text = response.content
+            response_text = response.choices[0].message.content
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 args = json.loads(json_match.group())
@@ -1321,19 +1287,24 @@ Response:"""
             Generated response
         """
         messages = [
-            SystemMessage(content="You are a helpful AI assistant. Provide a clear and concise response to the task."),
-            HumanMessage(content=f"Context: {context}\n\nTask: {task_description}\n\nYour response:")
+            {"role": "system", "content": "You are a helpful AI assistant. Provide a clear and concise response to the task."},
+            {"role": "user", "content": f"Context: {context}\n\nTask: {task_description}\n\nYour response:"}
         ]
 
         logger.debug(f"[ASYNC-RESPONSE] Generating response for: {task_description}")
 
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
 
         # Track metrics
         self._update_token_usage(response)
 
-        logger.debug(f"[ASYNC-RESPONSE] Generated: {response.content}")
-        return response.content
+        response_text = response.choices[0].message.content
+        logger.debug(f"[ASYNC-RESPONSE] Generated: {response_text}")
+        return response_text
 
     async def _acheck_completion(self, original_request: str, execution_history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Async version: Check if the task has been completed.
@@ -1356,13 +1327,17 @@ Response:"""
         )
 
         messages = [
-            SystemMessage(content=self.completion_check_prompt),
-            HumanMessage(content=f"Original request: {original_request}\n\nExecution history:\n{history_summary}\n\nIs the task complete?")
+            {"role": "system", "content": self.completion_check_prompt},
+            {"role": "user", "content": f"Original request: {original_request}\n\nExecution history:\n{history_summary}\n\nIs the task complete?"}
         ]
 
         logger.debug(f"[ASYNC-COMPLETION] Checking completion for: {original_request}")
 
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.7
+        )
 
         # Track metrics
         if self.current_metrics:
@@ -1370,7 +1345,7 @@ Response:"""
         self._update_token_usage(response)
 
         try:
-            response_text = response.content
+            response_text = response.choices[0].message.content
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 completion_status = json.loads(json_match.group())
@@ -1399,13 +1374,14 @@ def create_gemma_agent(
     input_schema: Optional[Type[BaseModel]] = None,
     output_schema: Optional[Type[BaseModel]] = None,
     output_key: Optional[str] = None,
-    state: Optional[Union[Dict[str, Any], 'SharedState']] = None,
+    state: Optional[SharedState] = None,
     max_iterations: int = 10,
     enable_memory: bool = False,
     memory_backend: str = "in_memory",
     max_context_tokens: int = 4096,
     memory_context_ratio: float = 0.3,
-    max_memory_size: Optional[int] = 100
+    max_memory_size: Optional[int] = 100,
+    use_async: bool = False
 ) -> ReasoningAgent:
     """Create a ReasoningAgent configured for Gemma3:27b.
 
@@ -1417,24 +1393,29 @@ def create_gemma_agent(
         input_schema: Optional Pydantic BaseModel for structured input validation
         output_schema: Optional Pydantic BaseModel for structured output
         output_key: Optional key to save output in shared state
-        state: Optional shared state (dict or SharedState from graph module)
+        state: Optional SharedState instance for state management
         max_iterations: Maximum number of reasoning-execution loops (default: 10)
         enable_memory: Whether to enable memory management
         memory_backend: Type of memory backend ("in_memory" or "vector_store")
         max_context_tokens: Maximum tokens for context window
         memory_context_ratio: Ratio of context to use for memory (0.0 to 1.0)
         max_memory_size: Maximum number of memories to keep (None for unlimited)
+        use_async: Whether to use AsyncOpenAI client (default: False for OpenAI client)
 
     Returns:
         Configured ReasoningAgent instance
     """
-    # Configure LLM for Gemma through OpenAI-compatible API
-    llm = ChatOpenAI(
-        base_url=api_base,
-        model=model,
-        temperature=0.7,
-        api_key="not-needed"  # Ollama doesn't require an API key
-    )
+    # Configure OpenAI client for Gemma through OpenAI-compatible API
+    if use_async:
+        llm = AsyncOpenAI(
+            base_url=api_base,
+            api_key="not-needed"  # Ollama doesn't require an API key
+        )
+    else:
+        llm = OpenAI(
+            base_url=api_base,
+            api_key="not-needed"  # Ollama doesn't require an API key
+        )
 
     if tools is None:
         tools = []
@@ -1442,19 +1423,23 @@ def create_gemma_agent(
     # Create memory manager if enabled
     memory_manager = None
     if enable_memory and MEMORY_AVAILABLE:
-        memory_manager = create_memory_manager(
-            backend_type=memory_backend,
-            max_context_tokens=max_context_tokens,
-            summary_threshold_tokens=int(max_context_tokens * 0.5),
-            llm=llm,
-            max_size=max_memory_size
-        )
-        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend")
+        # Note: Memory manager may need to be updated to work with OpenAI client
+        # For now, we'll skip memory manager initialization with OpenAI client
+        logger.warning("[MEMORY] Memory manager integration with OpenAI client needs to be implemented")
+        # memory_manager = create_memory_manager(
+        #     backend_type=memory_backend,
+        #     max_context_tokens=max_context_tokens,
+        #     summary_threshold_tokens=int(max_context_tokens * 0.5),
+        #     llm=llm,
+        #     max_size=max_memory_size
+        # )
+        # logger.info(f"[MEMORY] Initialized {memory_backend} memory backend")
     elif enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
     return ReasoningAgent(
         llm=llm,
+        model=model,
         tools=tools,
         verbose=verbose,
         input_schema=input_schema,
