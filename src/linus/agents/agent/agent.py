@@ -277,7 +277,11 @@ class ReasoningAgent(Agent):
         state: Optional[SharedState] = None,
         max_iterations: int = 10,
         memory_manager: Optional['MemoryManager'] = None,
-        memory_context_ratio: float = 0.3
+        memory_context_ratio: float = 0.3,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     ):
         """Initialize the reasoning agent.
 
@@ -293,6 +297,10 @@ class ReasoningAgent(Agent):
             max_iterations: Maximum number of reasoning-execution loops before stopping
             memory_manager: Optional memory manager for context persistence
             memory_context_ratio: Ratio of context window to use for memory (0.0 to 1.0)
+            temperature: Sampling temperature for LLM calls
+            max_tokens: Maximum tokens to generate in completion
+            top_p: Nucleus sampling parameter
+            top_k: Top-k sampling parameter
         """
         super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
         self.reasoning_prompt = self._create_reasoning_prompt()
@@ -301,7 +309,36 @@ class ReasoningAgent(Agent):
         self.max_iterations = max_iterations
         self.current_metrics: Optional[AgentMetrics] = None
         self.memory_context_ratio = max(0.0, min(1.0, memory_context_ratio))  # Clamp to 0-1
-    
+
+        # LLM generation parameters
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+
+    def _get_generation_kwargs(self) -> Dict[str, Any]:
+        """Build kwargs for LLM generation with configured parameters.
+
+        Returns:
+            Dictionary of generation parameters for OpenAI API calls
+        """
+        kwargs = {
+            "model": self.model,
+            "temperature": self.temperature
+        }
+
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+
+        # Note: top_k is not part of OpenAI API spec, but Ollama supports it as extra_body
+        if self.top_k is not None:
+            kwargs["extra_body"] = {"top_k": self.top_k}
+
+        return kwargs
+
     def _create_reasoning_prompt(self) -> str:
         """Create the prompt template for the reasoning phase."""
         tool_descriptions = "\n".join([
@@ -750,9 +787,8 @@ Response:"""
         logger.debug(f"[REASONING] Messages: {messages}")
 
         response = self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[REASONING] Raw response: {response_text}")
@@ -877,9 +913,8 @@ Response:"""
         ]
 
         response = self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[TOOL_ARGS] Raw response: {response_text}")
@@ -922,9 +957,8 @@ Response:"""
         ]
 
         response = self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[GENERATE] Response: {response_text}")
@@ -973,9 +1007,8 @@ Response:"""
         logger.debug(f"[COMPLETION_CHECK] History: {history_text[:500]}")
 
         response = self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[COMPLETION_CHECK] Raw response: {response_text}")
@@ -1102,9 +1135,8 @@ Response:"""
         ]
 
         response = self.llm.chat.completions.create(
-            model=self.model,
             messages=messages,
-            temperature=0.7
+            **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
         logger.debug(f"[FINAL] Final response: {response_text}")
@@ -1369,6 +1401,11 @@ Response:"""
 def create_gemma_agent(
     api_base: str = "http://localhost:11434/v1",  # Ollama OpenAI-compatible endpoint
     model: str = "gemma3:27b",
+    api_key: str = "not-needed",
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
     input_schema: Optional[Type[BaseModel]] = None,
@@ -1383,11 +1420,16 @@ def create_gemma_agent(
     max_memory_size: Optional[int] = 100,
     use_async: bool = False
 ) -> ReasoningAgent:
-    """Create a ReasoningAgent configured for Gemma3:27b.
+    """Create a ReasoningAgent configured for Gemma3:27b or other OpenAI-compatible models.
 
     Args:
-        api_base: The OpenAI-compatible API endpoint
-        model: The model name
+        api_base: The OpenAI-compatible API endpoint (e.g., "http://localhost:11434/v1" for Ollama)
+        model: The model name (e.g., "gemma3:27b" for Ollama, "gpt-4" for OpenAI)
+        api_key: API key for authentication (default: "not-needed" for Ollama, required for OpenAI)
+        temperature: Sampling temperature (0.0 to 2.0). Higher = more random (default: 0.7)
+        max_tokens: Maximum tokens to generate in completion (default: None = model default)
+        top_p: Nucleus sampling parameter (0.0 to 1.0). Alternative to temperature (default: None)
+        top_k: Top-k sampling parameter. Only available on some models like Ollama (default: None)
         tools: List of tools available to the agent
         verbose: Whether to enable verbose logging
         input_schema: Optional Pydantic BaseModel for structured input validation
@@ -1397,24 +1439,45 @@ def create_gemma_agent(
         max_iterations: Maximum number of reasoning-execution loops (default: 10)
         enable_memory: Whether to enable memory management
         memory_backend: Type of memory backend ("in_memory" or "vector_store")
-        max_context_tokens: Maximum tokens for context window
+        max_context_tokens: Maximum tokens for context window (for memory management, not generation)
         memory_context_ratio: Ratio of context to use for memory (0.0 to 1.0)
         max_memory_size: Maximum number of memories to keep (None for unlimited)
         use_async: Whether to use AsyncOpenAI client (default: False for OpenAI client)
 
     Returns:
         Configured ReasoningAgent instance
+
+    Examples:
+        # For Ollama (local):
+        agent = create_gemma_agent(
+            api_base="http://localhost:11434/v1",
+            model="gemma3:27b",
+            api_key="not-needed",
+            temperature=0.7,
+            max_tokens=2048,
+            top_k=40
+        )
+
+        # For OpenAI:
+        agent = create_gemma_agent(
+            api_base="https://api.openai.com/v1",
+            model="gpt-4",
+            api_key="sk-...",
+            temperature=0.5,
+            max_tokens=1000,
+            top_p=0.9
+        )
     """
     # Configure OpenAI client for Gemma through OpenAI-compatible API
     if use_async:
         llm = AsyncOpenAI(
             base_url=api_base,
-            api_key="not-needed"  # Ollama doesn't require an API key
+            api_key=api_key
         )
     else:
         llm = OpenAI(
             base_url=api_base,
-            api_key="not-needed"  # Ollama doesn't require an API key
+            api_key=api_key
         )
 
     if tools is None:
@@ -1448,5 +1511,9 @@ def create_gemma_agent(
         state=state,
         max_iterations=max_iterations,
         memory_manager=memory_manager,
-        memory_context_ratio=memory_context_ratio
+        memory_context_ratio=memory_context_ratio,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        top_k=top_k
     )
