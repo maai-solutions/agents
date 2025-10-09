@@ -2,6 +2,7 @@
 
 import os
 import sys
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -14,11 +15,11 @@ from linus.agents.telemetry import initialize_telemetry
 from linus.agents.agent import Agent, get_default_tools
 from loguru import logger
 
-def main():
-    """Test Langfuse integration."""
+async def main():
+    """Test Langfuse integration with async agent."""
 
     logger.info("=" * 60)
-    logger.info("Testing Langfuse Integration")
+    logger.info("Testing Langfuse Integration (Async)")
     logger.info("=" * 60)
 
     # Check environment variables
@@ -53,8 +54,8 @@ def main():
 
     logger.info("✓ Langfuse tracer initialized")
 
-    # Create agent with tracer
-    logger.info("✓ Creating agent...")
+    # Create async agent with tracer
+    logger.info("✓ Creating async agent...")
     agent = Agent(
         api_base=os.getenv("LLM_API_BASE", "http://localhost:11434/v1"),
         model=os.getenv("LLM_MODEL", "gemma3:27b"),
@@ -62,10 +63,13 @@ def main():
         temperature=0.7,
         tools=get_default_tools()[:2],  # Just use a couple tools for testing
         verbose=True,
-        tracer=tracer
+        use_async=True  # Enable async mode
     )
 
-    logger.info("✓ Agent created with Langfuse tracer")
+    # Assign the tracer to the agent
+    agent.tracer = tracer
+
+    logger.info("✓ Async agent created with Langfuse tracer")
 
     # Run a simple test query
     test_query = "Calculate 42 * 17"
@@ -73,7 +77,8 @@ def main():
     logger.info("-" * 60)
 
     try:
-        response = agent.run(test_query)
+        # Use await since agent.run() is now async
+        response = await agent.run(test_query)
         logger.info("-" * 60)
         logger.info(f"✓ Response received: {response.result if hasattr(response, 'result') else response}")
 
@@ -92,4 +97,4 @@ def main():
         return
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

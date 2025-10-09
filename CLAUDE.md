@@ -86,7 +86,12 @@ Environment variables are configured in `.env`:
   - `_generate_tool_arguments()`: Uses LLM to generate JSON arguments for tool calls
   - `_format_final_response()`: Combines multi-step results into coherent response
   - `_get_generation_kwargs()`: Builds generation parameters (temperature, max_tokens, top_p, top_k)
-- `create_gemma_agent()`: Factory function to create configured ReasoningAgent instances
+
+**Agent Factory** (`src/linus/agents/agent/factory.py`):
+- `Agent()`: Factory function to create configured ReasoningAgent instances
+  - Supports both sync (`OpenAI`) and async (`AsyncOpenAI`) clients
+  - Configurable memory management (in-memory or vector store)
+  - Built-in telemetry/tracing support (Langfuse or OpenTelemetry)
 
 **Tools** (`src/linus/agents/agent/tools.py`):
 - `SearchTool`: Mock search implementation
@@ -164,9 +169,9 @@ json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
 
 **Tool Execution:**
 Tools are stored in `agent.tool_map` (dict keyed by tool name). The agent:
-1. Gets tool schema from `tool.args_schema.schema()`
+1. Gets tool schema from `tool.args_schema.model_json_schema()` (Pydantic v2)
 2. Prompts LLM to generate arguments matching the schema
-3. Executes: `tool.run(tool_args)`
+3. Executes: `tool.arun(tool_args)` (async) or `tool.run(tool_args)` (sync)
 
 **API Async Handling:**
 FastAPI endpoints run synchronous agent code using `loop.run_in_executor()` to avoid blocking.
@@ -182,7 +187,8 @@ The agent uses the native OpenAI Python client instead of LangChain:
 
 When importing from the project:
 ```python
-from linus.agents.agent.agent import ReasoningAgent, create_gemma_agent
+from linus.agents.agent.factory import Agent
+from linus.agents.agent.reasoning_agent import ReasoningAgent
 from linus.agents.agent.tools import get_default_tools, create_custom_tool
 ```
 
@@ -192,11 +198,12 @@ Note: The `src/` directory must be in PYTHONPATH or use relative imports from `s
 
 ### Basic Usage (Ollama)
 ```python
-from linus.agents.agent.agent import create_gemma_agent
+from linus.agents.agent.factory import Agent
 from linus.agents.agent.tools import get_default_tools
+import asyncio
 
-# Create agent for local Ollama
-agent = create_gemma_agent(
+# Create agent for local Ollama (async by default)
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     api_key="not-needed",
@@ -204,17 +211,24 @@ agent = create_gemma_agent(
     max_tokens=2048,
     top_k=40,  # Ollama-specific
     tools=get_default_tools(),
-    verbose=True
+    verbose=True,
+    use_async=True  # Use AsyncOpenAI client
 )
 
-# Run the agent
-response = agent.run("What is 42 * 17?")
-print(response.result)  # AgentResponse with result, metrics, execution_history
+# Run the agent (async)
+async def main():
+    response = await agent.run("What is 42 * 17?")
+    print(response.result)  # AgentResponse with result, metrics, execution_history
+
+asyncio.run(main())
 ```
 
 ### OpenAI API Usage
 ```python
-agent = create_gemma_agent(
+from linus.agents.agent.factory import Agent
+from linus.agents.agent.tools import get_default_tools
+
+agent = Agent(
     api_base="https://api.openai.com/v1",
     model="gpt-4",
     api_key="sk-...",  # Your OpenAI API key
@@ -222,22 +236,23 @@ agent = create_gemma_agent(
     max_tokens=1000,
     top_p=0.9,
     tools=get_default_tools(),
-    verbose=True
+    verbose=True,
+    use_async=True
 )
 ```
 
-### Async Usage
+### Synchronous Usage
 ```python
-# Create async agent
-agent = create_gemma_agent(
+# Create synchronous agent (not recommended for production)
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
-    use_async=True,  # Use AsyncOpenAI client
+    use_async=False,  # Use sync OpenAI client
     temperature=0.7
 )
 
-# Use async run method
-response = await agent.arun("Calculate 100 + 200")
+# Note: ReasoningAgent.run() is async, so you still need to await it
+response = await agent.run("Calculate 100 + 200")
 ```
 
 ### Generation Parameters
@@ -286,6 +301,9 @@ To get just the result string: `agent.run(query, return_metrics=False)`
 Langfuse provides LLM-specific observability with automatic tracking of prompts, completions, tokens, and costs:
 
 ```python
+import asyncio
+from linus.agents.agent.factory import Agent
+from linus.agents.agent.tools import get_default_tools
 from linus.agents.telemetry import initialize_telemetry
 
 # Initialize Langfuse tracer
@@ -296,40 +314,45 @@ tracer = initialize_telemetry(
 )
 
 # Create agent with Langfuse tracing
-agent = create_gemma_agent(
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools(),
-    tracer=tracer  # Pass tracer to agent
+    tracer=tracer,  # Pass tracer to agent
+    use_async=True
 )
 
 # Run queries - automatically traced in Langfuse
-response = agent.run("What is 42 * 17?")
+async def main():
+    response = await agent.run("What is 42 * 17?")
+    print(response.result)
 
-# Flush traces before exit
-tracer.flush()
+    # Flush traces before exit
+    tracer.flush()
+
+asyncio.run(main())
 ```
 
 **With Session ID for monitoring sessions:**
 ```python
-# Initialize Langfuse tracer with session ID
-tracer = initialize_telemetry(
-    service_name="my-agent",
-    exporter_type="langfuse",
-    session_id="user-123-session-456",  # Group traces by session
-    enabled=True
-)
+from linus.agents.agent.factory import Agent
+from linus.agents.agent.tools import get_default_tools
 
-# Or set session_id directly on agent
-agent = create_gemma_agent(
+# Create agent with session_id for Langfuse session grouping
+agent = Agent(
     api_base="http://localhost:11434/v1",
     model="gemma3:27b",
     tools=get_default_tools(),
-    session_id="user-123-session-456"  # Automatically creates Langfuse tracer with session
+    session_id="user-123-session-456",  # Groups traces by session in Langfuse
+    use_async=True
 )
 
 # All traces from this agent will be grouped under the same session
-response = agent.run("What is 42 * 17?")
+async def main():
+    response = await agent.run("What is 42 * 17?")
+    print(response.result)
+
+asyncio.run(main())
 ```
 
 **Environment variables required:**

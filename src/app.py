@@ -13,18 +13,28 @@ from datetime import datetime
 from loguru import logger
 
 from dotenv import load_dotenv
+import os
+from pathlib import Path
 
+from linus.agents.agent.mcp_client import MCPServerConfig, connect_mcp_servers
 from linus.agents.tools.entities_search import EntitiesSearchTool
 from linus.agents.tools.vector_store import VectorStoreTool
-load_dotenv()
+
+# Load .env from src directory (where this file is located)
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 from linus.agents.agent import ReasoningAgent, Agent, get_default_tools, create_custom_tool
 from linus.agents.telemetry import initialize_telemetry, get_tracer
 from linus.settings import Settings
 
 
-# Configure logging early with rich support
-os.makedirs("logs", exist_ok=True)
+# Load settings first
+settings = Settings()
+
+# Configure logging early with rich support using settings
+if settings.log_file:
+    os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
 
 # Rich console handler for beautiful terminal output
 from rich.console import Console
@@ -37,29 +47,27 @@ logger.remove()
 logger.add(
     RichHandler(
         console=console,
-        rich_tracebacks=True,
+        rich_tracebacks=settings.log_rich_tracebacks,
         tracebacks_show_locals=True,
         markup=True,
-        show_time=True,
+        show_time=settings.log_show_time,
         show_level=True,
-        show_path=True
+        show_path=settings.log_show_path
     ),
     format="{message}",
-    level="INFO"
+    level=settings.log_console_level
 )
 
-# File handler for detailed logs
-logger.add(
-    "logs/agent_api.log",
-    rotation="10 MB",
-    retention="7 days",
-    compression="zip",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}",
-    level="DEBUG"
-)
-
-
-settings = Settings()
+# File handler for detailed logs (if configured)
+if settings.log_file:
+    logger.add(
+        settings.log_file,
+        rotation=settings.log_file_rotation,
+        retention=settings.log_file_retention,
+        compression=settings.log_file_compression,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}",
+        level=settings.log_file_level
+    )
 
 # Global agent instance
 agent: Optional[ReasoningAgent] = None
@@ -111,6 +119,7 @@ class HealthResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     global agent
+    mcp_manager = None  # Store MCP manager for cleanup
 
     # Startup
     logger.info("Starting ReasoningAgent API...")
@@ -140,7 +149,7 @@ async def lifespan(app: FastAPI):
 
     try:
         # Initialize the agent
-        tools = []
+        tools = [] #get_default_tools()  # Start with default tools
 
         # Add some custom tools for testing
         def get_time() -> str:
@@ -154,11 +163,47 @@ async def lifespan(app: FastAPI):
         )
         tools.append(time_tool)
 
-        vector_store_tool = VectorStoreTool()
-        tools.append(vector_store_tool)
+        # vector_store_tool = VectorStoreTool()
+        # tools.append(vector_store_tool)
         
         entities_search_tool = EntitiesSearchTool()
         tools.append(entities_search_tool)
+        
+        servers = {
+        "filesystem": MCPServerConfig(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        ),
+        "time": MCPServerConfig(
+            command="docker",
+            args=["run", "-i", "--rm", "mcp/time"]
+        ),
+         "sequentialthinking": MCPServerConfig(
+            command="docker",
+            args=["run", "-i", "--rm", "mcp/sequentialthinking"]
+        ),
+         "memory": MCPServerConfig(
+            command="docker",
+            args=["run", "-i", "--rm", "-v", "/Users/udg/Projects/Git/agents/memory:/memory", "mcp/memory"]
+        ),
+         "vector-store": MCPServerConfig(
+            command="python",
+            args=["-m", "linus.mcp.vector_store"],
+            cwd="/Users/udg/Projects/Git/agents/src",
+            env={
+                "WV_HTTP_HOST": "localhost",
+                "WV_HTTP_PORT": "18080",
+                "WV_GRPC_HOST": "localhost",
+                "WV_GRPC_PORT": "50051",
+                "LLM_API_BASE": "http://localhost:11434/v1"
+            }
+        )
+    }
+
+        # Connect and get tools
+        mcp_manager, mcp_tools = await connect_mcp_servers(servers)
+
+        tools = tools + mcp_tools
 
         agent = Agent(
             api_base=settings.llm_api_base,
@@ -170,7 +215,8 @@ async def lifespan(app: FastAPI):
             top_k=settings.llm_top_k,
             tools=tools,
             verbose=settings.agent_verbose,
-            tracer=tracer
+            tracer=tracer,
+            use_async=True  # Use AsyncOpenAI for MCP tool support
         )
         
         logger.info(f"Agent initialized with {len(tools)} tools")
@@ -181,9 +227,19 @@ async def lifespan(app: FastAPI):
         raise
     
     yield
-    
+
     # Shutdown
     logger.info("Shutting down ReasoningAgent API...")
+
+    # Cleanup MCP connections
+    if mcp_manager:
+        try:
+            logger.info("Disconnecting MCP servers...")
+            await mcp_manager.disconnect_all()
+            logger.info("MCP servers disconnected")
+        except Exception as e:
+            logger.error(f"Error disconnecting MCP servers: {e}")
+
     conversation_history.clear()
 
 
@@ -232,9 +288,8 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
     start_time = datetime.now()
     
     try:
-        # Run the agent (this is synchronous, so we run it in a thread pool)
-        loop = asyncio.get_event_loop()
-        agent_response = await loop.run_in_executor(None, agent.run, request.query)
+        # Run the agent (async-only)
+        agent_response = await agent.run(request.query)
 
         execution_time = (datetime.now() - start_time).total_seconds()
 

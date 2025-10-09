@@ -27,12 +27,12 @@ class EntitiesSearchTool(BaseTool):
 
         # Initialize Weaviate client
         self.client = weaviate.connect_to_custom(
-            http_host=self.settings.wv_url,
-            http_port=self.settings.wv_port,
-            http_secure=(self.settings.wv_scheme == "https"),
-            grpc_host=self.settings.wv_url,
-            grpc_port=50051,
-            grpc_secure=(self.settings.wv_scheme == "https"),
+            http_host=self.settings.wv_http_host,
+            http_port=self.settings.wv_http_port,
+            http_secure=(self.settings.wv_http_scheme == "https"),
+            grpc_host=self.settings.wv_grpc_host,
+            grpc_port=self.settings.wv_grpc_port,
+            grpc_secure=(self.settings.wv_grpc_scheme == "https"),
         )
 
         # Initialize OpenAI client for embeddings

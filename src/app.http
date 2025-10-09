@@ -69,7 +69,7 @@ Content-Type: application/json
     "query": "why are the whales in danger",
     "tools": true,
     "stream": false,
-    "session_id": "bcd"
+    "session_id": "abc"
 }
 
 ### TEST QUERY WITH VECTOR STORE

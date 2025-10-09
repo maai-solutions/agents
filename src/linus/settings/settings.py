@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     agent_verbose: bool = True
     agent_timeout: int = 300  # 5 minutes timeout
 
+    # Logging configuration
+    log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_file: Optional[str] = None  # Path to log file (None disables file logging)
+    log_file_level: str = "DEBUG"  # Log level for file output
+    log_console_level: str = "INFO"  # Log level for console output
+    log_show_path: bool = True  # Show file path in console logs
+    log_show_time: bool = True  # Show timestamp in console logs
+    log_rich_tracebacks: bool = True  # Enable rich tracebacks with syntax highlighting
+    log_file_rotation: str = "10 MB"  # Log file rotation size
+    log_file_retention: str = "7 days"  # Log file retention period
+    log_file_compression: str = "zip"  # Log file compression format
+
     # Telemetry configuration
     telemetry_enabled: bool = True
     telemetry_exporter: str = "langfuse"  # console, otlp, jaeger, langfuse
@@ -48,9 +60,12 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # Weaviate configuration
-    wv_url: str = "localhost"
-    wv_port: int = 18080
-    wv_scheme: str = "http"
+    wv_http_host: str = "localhost"
+    wv_http_port: int = 18080
+    wv_http_scheme: str = "http"
+    wv_grpc_host: str = "localhost"
+    wv_grpc_port: int = 50051
+    wv_grpc_scheme: str = "http"
     wv_collection: str = "arag_dev"
     wv_max_distance: float = 0.7
     wv_alpha: float = 0.5

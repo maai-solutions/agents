@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  mcp-vector-store:
+    build:
+      context: ../../../..
+      dockerfile: src/linus/mcp/vector_store/Dockerfile
+    container_name: mcp-vector-store
+    restart: unless-stopped
+    environment:
+      # Weaviate configuration
+      - WV_HTTP_HOST=${WV_HTTP_HOST:-weaviate}
+      - WV_HTTP_PORT=${WV_HTTP_PORT:-8080}
+      - WV_HTTP_SCHEME=${WV_HTTP_SCHEME:-http}
+      - WV_GRPC_HOST=${WV_GRPC_HOST:-weaviate}
+      - WV_GRPC_PORT=${WV_GRPC_PORT:-50051}
+      - WV_GRPC_SCHEME=${WV_GRPC_SCHEME:-http}
+      - WV_COLLECTION=${WV_COLLECTION:-arag_dev}
+      - WV_MAX_DISTANCE=${WV_MAX_DISTANCE:-0.7}
+      - WV_ALPHA=${WV_ALPHA:-0.5}
+      - WV_LIMIT=${WV_LIMIT:-5}
+      - WV_EMBEDDING_MODEL=${WV_EMBEDDING_MODEL:-nomic-embed-text:latest}
+
+      # LLM configuration (for embeddings)
+      - LLM_API_BASE=${LLM_API_BASE:-http://ollama:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-gemma3:27b}
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+
+      # Telemetry (optional)
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-false}
+    networks:
+      - mcp-network
+    depends_on:
+      - weaviate
+      - ollama
+    stdin_open: true
+    tty: true
+
+  # Weaviate vector database
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    container_name: weaviate
+    restart: unless-stopped
+    ports:
+      - "18080:8080"
+      - "50051:50051"
+    environment:
+      - QUERY_DEFAULTS_LIMIT=25
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - DEFAULT_VECTORIZER_MODULE=none
+      - ENABLE_MODULES=
+      - CLUSTER_HOSTNAME=node1
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    networks:
+      - mcp-network
+
+  # Ollama for embeddings
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - mcp-network
+    command: serve
+
+networks:
+  mcp-network:
+    driver: bridge
+
+volumes:
+  weaviate-data:
+  ollama-data:

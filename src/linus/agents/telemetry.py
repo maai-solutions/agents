@@ -106,12 +106,26 @@ def setup_telemetry(config: TelemetryConfig) -> Optional[Any]:
                 logger.error("[TELEMETRY] Langfuse credentials not provided")
                 return None
 
+            # Set environment variables for get_client() to pick up
+            import os
+            os.environ['LANGFUSE_PUBLIC_KEY'] = config.langfuse_public_key
+            os.environ['LANGFUSE_SECRET_KEY'] = config.langfuse_secret_key
+            os.environ['LANGFUSE_HOST'] = config.langfuse_host
+
+            # Initialize Langfuse client directly for better compatibility
             langfuse_client = Langfuse(
                 public_key=config.langfuse_public_key,
                 secret_key=config.langfuse_secret_key,
                 host=config.langfuse_host
             )
+            logger.info(f"[TELEMETRY] Langfuse client initialized: {type(langfuse_client)}")
             logger.info(f"[TELEMETRY] Langfuse initialized at {config.langfuse_host}")
+            logger.info(f"[TELEMETRY] Langfuse public key: {config.langfuse_public_key[:8]}...")
+
+            # Check available methods for debugging
+            available_methods = [m for m in dir(langfuse_client) if not m.startswith('_') and callable(getattr(langfuse_client, m))]
+            logger.info(f"[TELEMETRY] Available Langfuse methods: {available_methods}")
+
             return langfuse_client
 
         # Setup OpenTelemetry
@@ -174,9 +188,6 @@ class LangfuseTracer:
         self.client = langfuse_client
         self.enabled = langfuse_client is not None and LANGFUSE_AVAILABLE
         self.session_id = session_id
-        self._current_trace = None
-        self._current_span = None
-        self._span_stack = []  # Stack of spans for nested contexts
 
     def trace_agent_run(
         self,
@@ -190,33 +201,46 @@ class LangfuseTracer:
             agent_type: Type of agent
 
         Returns:
-            Trace context
+            Trace context (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Create a new trace using Langfuse v3.x API
-        # start_as_current_span creates both the trace and root span
+        # Create metadata including session_id if available
         metadata = {"agent_type": agent_type}
         if self.session_id:
             metadata["session_id"] = self.session_id
 
-        # Create root span for the agent run
-        # Note: session_id is set in metadata, not as a parameter
-        span = self.client.start_as_current_span(
-            name="agent_run",
-            input={"query": user_input},
-            metadata=metadata
-        )
+        logger.info(f"[LANGFUSE] Creating trace span: agent_run with input: {user_input[:50]}...")
+        logger.info(f"[LANGFUSE] Client type: {type(self.client)}, enabled: {self.enabled}")
+        logger.info(f"[LANGFUSE] Metadata: {metadata}")
 
-        self._current_trace = span
-        self._span_stack.append(span)
+        try:
+            # Use Langfuse's context manager API properly
+            from contextlib import asynccontextmanager
 
-        logger.debug(f"[LANGFUSE] Created trace span: agent_run")
+            @asynccontextmanager
+            async def async_trace_wrapper():
+                """Wrap Langfuse context manager for async usage."""
+                # Use start_as_current_span to create a trace-level span
+                with self.client.start_as_current_span(
+                    name="agent_run",
+                    input={"query": user_input},
+                    metadata=metadata
+                ) as span:
+                    logger.info(f"[LANGFUSE] Trace span started: {type(span)}")
+                    # Yield the span for the context
+                    try:
+                        yield span
+                    finally:
+                        logger.info("[LANGFUSE] Trace span ended")
 
-        # Return the span object (it's a context manager)
-        return span
+            return async_trace_wrapper()
+        except Exception as e:
+            logger.exception(f"[LANGFUSE] Error creating trace span: {e}")
+            from contextlib import nullcontext
+            return nullcontext()
 
     def trace_reasoning_phase(
         self,
@@ -230,25 +254,34 @@ class LangfuseTracer:
             iteration: Current iteration number
 
         Returns:
-            Span context
+            Span context (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Create a child span for reasoning
-        span = self.client.start_as_current_span(
-            name="reasoning_phase",
-            input={"text": input_text[:500], "iteration": iteration},
-            metadata={"iteration": iteration}
-        )
+        # Use Langfuse's nested span API
+        logger.debug(f"[LANGFUSE] Creating reasoning span for iteration {iteration}")
 
-        self._span_stack.append(span)
-        self._current_span = span
+        # Create nested span using Langfuse context manager
+        from contextlib import asynccontextmanager
 
-        logger.debug(f"[LANGFUSE] Created reasoning span for iteration {iteration}")
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Create reasoning span within current trace."""
+            try:
+                with self.client.start_as_current_span(
+                    name="reasoning_phase",
+                    input={"text": input_text, "iteration": iteration},
+                    metadata={"iteration": iteration}
+                ) as span:
+                    logger.debug(f"[LANGFUSE] Reasoning span created: {type(span)}")
+                    yield span
+            except Exception as e:
+                logger.warning(f"[LANGFUSE] Error creating reasoning span: {e}")
+                yield None
 
-        return span
+        return async_span_wrapper()
 
     def trace_llm_call(
         self,
@@ -264,24 +297,36 @@ class LangfuseTracer:
             call_type: Type of call (reasoning, tool_args, generate)
 
         Returns:
-            Generation context
+            Generation context (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Create a generation span for LLM calls using Langfuse v3.x API
-        generation = self.client.start_as_current_observation(
-            as_type="generation",
-            name=f"llm_{call_type}",
-            model=model,
-            input=prompt[:1000],  # Limit input size
-            metadata={"call_type": call_type}
-        )
+        # Use Langfuse's generation API
+        logger.debug(f"[LANGFUSE] Creating generation span: llm_{call_type}")
 
-        logger.debug(f"[LANGFUSE] Created generation span: llm_{call_type}")
+        # Create generation using Langfuse context manager
+        from contextlib import asynccontextmanager
 
-        return generation
+        @asynccontextmanager
+        async def async_observation_wrapper():
+            """Create generation within current trace."""
+            try:
+                with self.client.start_as_current_observation(
+                    as_type='generation',
+                    name=f"llm_{call_type}",
+                    model=model,
+                    input=prompt,
+                    metadata={"call_type": call_type}
+                ) as generation:
+                    logger.debug(f"[LANGFUSE] Generation created: {type(generation)}")
+                    yield generation
+            except Exception as e:
+                logger.warning(f"[LANGFUSE] Error creating generation: {e}")
+                yield None
+
+        return async_observation_wrapper()
 
     def trace_tool_execution(
         self,
@@ -295,22 +340,34 @@ class LangfuseTracer:
             tool_args: Arguments passed to tool
 
         Returns:
-            Span context
+            Span context (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        # Create a child span for tool execution using Langfuse v3.x API
-        span = self.client.start_as_current_span(
-            name=f"tool_{tool_name}",
-            input=tool_args,
-            metadata={"tool": tool_name}
-        )
+        # Use Langfuse's span API
+        logger.debug(f"[LANGFUSE] Creating tool execution span: tool_{tool_name}")
 
-        logger.debug(f"[LANGFUSE] Created tool execution span: tool_{tool_name}")
+        # Create span using Langfuse context manager
+        from contextlib import asynccontextmanager
 
-        return span
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Create tool execution span within current trace."""
+            try:
+                with self.client.start_as_current_span(
+                    name=f"tool_{tool_name}",
+                    input=tool_args,
+                    metadata={"tool": tool_name}
+                ) as span:
+                    logger.debug(f"[LANGFUSE] Tool span created: {type(span)}")
+                    yield span
+            except Exception as e:
+                logger.warning(f"[LANGFUSE] Error creating tool span: {e}")
+                yield None
+
+        return async_span_wrapper()
 
     def add_event(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         """Add an event to the current trace.
@@ -368,28 +425,32 @@ class LangfuseTracer:
         # Store status for later - will be used when trace is ended
         logger.debug(f"[LANGFUSE] Status set: {status_code} - {description}")
 
-    def update_generation(self, output: str, usage: Optional[Dict[str, int]] = None):
+    def update_generation(self, output: Any, usage: Optional[Dict[str, int]] = None):
         """Update the current LLM generation with output and usage stats.
 
         Args:
-            output: Generated output
+            output: Generated output (can be string or dict)
             usage: Token usage stats (prompt_tokens, completion_tokens, total_tokens)
         """
         if not self.enabled:
             return
 
-        # Generations are updated via span.update() in the context manager
-        # This is called from reasoning_agent.py after LLM completion
-        logger.debug(f"[LANGFUSE] Generation update called with {len(output) if output else 0} chars output")
+        # Update the current generation using Langfuse API
+        output_len = len(str(output)) if output else 0
+        logger.debug(f"[LANGFUSE] Generation update called with {output_len} chars output")
 
-    def flush(self):
-        """Flush pending traces to Langfuse."""
-        if self.enabled and self.client:
-            try:
-                self.client.flush()
-                logger.info("[LANGFUSE] Flushed traces to Langfuse server")
-            except Exception as e:
-                logger.error(f"[LANGFUSE] Failed to flush traces: {e}")
+        try:
+            # Use the client's update methods with correct parameter names
+            update_kwargs = {"output": output}
+            if usage:
+                # Langfuse expects usage_details, not usage
+                update_kwargs["usage_details"] = usage
+                logger.debug(f"[LANGFUSE] Updating with usage: {usage}")
+
+            self.client.update_current_generation(**update_kwargs)
+            logger.info(f"[LANGFUSE] Successfully updated generation with output and usage")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to update generation: {e}")
 
     def record_metrics(self, metrics: Dict[str, Any]):
         """Record metrics on the current trace.
@@ -402,11 +463,76 @@ class LangfuseTracer:
 
         try:
             # Update the current trace with metrics metadata
-            # Langfuse v3.x supports update_current_trace
             self.client.update_current_trace(metadata={"metrics": metrics})
             logger.debug(f"[LANGFUSE] Recorded metrics: {list(metrics.keys())}")
         except Exception as e:
             logger.warning(f"[LANGFUSE] Failed to record metrics: {e}")
+
+    def flush(self):
+        """Flush pending traces to Langfuse."""
+        if self.enabled and self.client:
+            try:
+                self.client.flush()
+                logger.info("[LANGFUSE] Flushed traces to Langfuse server")
+            except Exception as e:
+                logger.error(f"[LANGFUSE] Failed to flush traces: {e}")
+
+    def set_attribute(self, key: str, value: Any):
+        """Set metadata on the current trace.
+
+        Args:
+            key: Attribute key
+            value: Attribute value
+        """
+        if not self.enabled:
+            return
+
+        try:
+            # Update current trace/span metadata
+            metadata = {key: value}
+            self.client.update_current_trace(metadata=metadata)
+            logger.debug(f"[LANGFUSE] Attribute set: {key}={value}")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to set attribute: {e}")
+
+    def record_exception(self, exception: Exception):
+        """Record an exception in the current trace.
+
+        Args:
+            exception: Exception to record
+        """
+        if not self.enabled:
+            return
+
+        try:
+            # Record error in trace/span
+            error_info = {
+                "error_type": type(exception).__name__,
+                "error_message": str(exception),
+                "status": "ERROR"
+            }
+            self.client.update_current_trace(metadata={"error": error_info})
+            logger.error(f"[LANGFUSE] Exception recorded: {type(exception).__name__}: {str(exception)}")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to record exception: {e}")
+
+    def set_status(self, status_code: str, description: str = ""):
+        """Set the status of the current trace.
+
+        Args:
+            status_code: Status code (OK, ERROR)
+            description: Status description
+        """
+        if not self.enabled:
+            return
+
+        try:
+            # Update trace with status
+            status_info = {"status": status_code, "description": description}
+            self.client.update_current_trace(metadata={"status": status_info})
+            logger.debug(f"[LANGFUSE] Status set: {status_code} - {description}")
+        except Exception as e:
+            logger.warning(f"[LANGFUSE] Failed to set status: {e}")
 
 
 class AgentTracer:
@@ -433,20 +559,29 @@ class AgentTracer:
             agent_type: Type of agent
 
         Returns:
-            Span context manager
+            Span context manager (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        return self.tracer.start_as_current_span(
-            "agent.run",
-            kind=SpanKind.SERVER,
-            attributes={
-                "agent.type": agent_type,
-                "agent.input": user_input[:500],  # Limit input size
-            }
-        )
+        # Wrap OpenTelemetry's sync context manager for async usage
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Wrap sync OpenTelemetry context manager for async usage."""
+            with self.tracer.start_as_current_span(
+                "agent.run",
+                kind=SpanKind.SERVER,
+                attributes={
+                    "agent.type": agent_type,
+                    "agent.input": user_input,  # No truncation
+                }
+            ) as span:
+                yield span
+
+        return async_span_wrapper()
 
     def trace_reasoning_phase(
         self,
@@ -460,19 +595,28 @@ class AgentTracer:
             iteration: Current iteration number
 
         Returns:
-            Span context manager
+            Span context manager (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        return self.tracer.start_as_current_span(
-            "agent.reasoning",
-            attributes={
-                "agent.reasoning.input": input_text[:500],
-                "agent.iteration": iteration,
-            }
-        )
+        # Wrap OpenTelemetry's sync context manager for async usage
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Wrap sync OpenTelemetry context manager for async usage."""
+            with self.tracer.start_as_current_span(
+                "agent.reasoning",
+                attributes={
+                    "agent.reasoning.input": input_text,  # No truncation
+                    "agent.iteration": iteration,
+                }
+            ) as span:
+                yield span
+
+        return async_span_wrapper()
 
     def trace_llm_call(
         self,
@@ -488,20 +632,29 @@ class AgentTracer:
             call_type: Type of call (reasoning, tool_args, generate)
 
         Returns:
-            Span context manager
+            Span context manager (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        return self.tracer.start_as_current_span(
-            f"llm.{call_type}",
-            attributes={
-                "llm.model": model,
-                "llm.prompt": prompt[:1000],  # Limit prompt size
-                "llm.call_type": call_type,
-            }
-        )
+        # Wrap OpenTelemetry's sync context manager for async usage
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Wrap sync OpenTelemetry context manager for async usage."""
+            with self.tracer.start_as_current_span(
+                f"llm.{call_type}",
+                attributes={
+                    "llm.model": model,
+                    "llm.prompt": prompt,  # No truncation
+                    "llm.call_type": call_type,
+                }
+            ) as span:
+                yield span
+
+        return async_span_wrapper()
 
     def trace_tool_execution(
         self,
@@ -515,19 +668,28 @@ class AgentTracer:
             tool_args: Arguments passed to tool
 
         Returns:
-            Span context manager
+            Span context manager (AsyncContextManager for async compatibility)
         """
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext()
 
-        return self.tracer.start_as_current_span(
-            f"tool.{tool_name}",
-            attributes={
-                "tool.name": tool_name,
-                "tool.args": str(tool_args)[:500],  # Limit args size
-            }
-        )
+        # Wrap OpenTelemetry's sync context manager for async usage
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Wrap sync OpenTelemetry context manager for async usage."""
+            with self.tracer.start_as_current_span(
+                f"tool.{tool_name}",
+                attributes={
+                    "tool.name": tool_name,
+                    "tool.args": str(tool_args),  # No truncation
+                }
+            ) as span:
+                yield span
+
+        return async_span_wrapper()
 
     def add_event(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         """Add an event to the current span.

@@ -14,7 +14,8 @@ def setup_rich_logging(
     show_path: bool = True,
     show_time: bool = True,
     rich_tracebacks: bool = True,
-    console: Optional[Console] = None
+    console: Optional[Console] = None,
+    use_stderr: bool = False
 ) -> Console:
     """Setup rich logging with loguru.
 
@@ -25,13 +26,15 @@ def setup_rich_logging(
         show_time: Show timestamp in console logs
         rich_tracebacks: Enable rich tracebacks with syntax highlighting
         console: Optional Rich Console instance (creates new if None)
+        use_stderr: Force output to stderr instead of stdout (required for MCP servers)
 
     Returns:
         Console instance used for logging
     """
     # Create or use provided console
     if console is None:
-        console = Console()
+        # Force stderr for MCP servers to avoid interfering with JSON-RPC protocol
+        console = Console(stderr=use_stderr)
 
     # Install rich tracebacks globally
     if rich_tracebacks:

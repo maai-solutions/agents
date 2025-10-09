@@ -23,41 +23,10 @@ class BaseTool(ABC):
             self.description = self.__class__.__doc__ or "No description available"
 
     @abstractmethod
-    def _run(self, *args, **kwargs) -> str:
-        """Execute the tool's action.
-
-        Must be implemented by subclasses.
-        """
-        raise NotImplementedError("Tool must implement _run method")
-
-    def run(self, tool_input: Dict[str, Any]) -> str:
-        """Run the tool with the given input.
-
-        Args:
-            tool_input: Dictionary of arguments for the tool
-
-        Returns:
-            Result of the tool execution as a string
-        """
-        # Validate input against schema if provided
-        if self.args_schema:
-            try:
-                validated_input = self.args_schema(**tool_input)
-                # Convert back to dict for _run method
-                tool_input = validated_input.model_dump()
-            except Exception as e:
-                return f"Error validating tool input: {str(e)}"
-
-        # Execute the tool
-        try:
-            return self._run(**tool_input)
-        except Exception as e:
-            return f"Error executing tool '{self.name}': {str(e)}"
-
     async def _arun(self, *args, **kwargs) -> str:
         """Async execution of the tool.
 
-        Optional - can be overridden by subclasses.
+        Must be implemented by subclasses.
         """
         raise NotImplementedError(f"Async execution not implemented for {self.name}")
 
@@ -135,11 +104,6 @@ class StructuredTool(BaseTool):
             func=func,
             args_schema=args_schema
         )
-
-    def _run(self, **kwargs) -> str:
-        """Execute the function."""
-        result = self.func(**kwargs)
-        return str(result)
 
     async def _arun(self, **kwargs) -> str:
         """Async execution."""
