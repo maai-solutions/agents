@@ -1,0 +1,38 @@
+# IMPORTANT REMINDER FOR CLAUDE
+
+## Always Activate Conda Environment First!
+
+Before running ANY Python or pip commands, ALWAYS activate the conda environment:
+
+```bash
+conda activate agents
+```
+
+## Correct Command Pattern
+
+Instead of:
+```bash
+python script.py
+pip install package
+```
+
+Always use:
+```bash
+source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh && conda activate agents && python script.py
+source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh && conda activate agents && pip install package
+```
+
+## Verifying Environment
+
+To check if you're in the correct environment:
+```bash
+source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh && conda activate agents && echo $CONDA_DEFAULT_ENV
+```
+
+Should output: `agents`
+
+## Why This Matters
+
+- The `agents` conda environment has all required packages installed
+- Running in base or no environment will cause import errors
+- Package installations in wrong environment won't be available to the app
