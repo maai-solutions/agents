@@ -111,8 +111,9 @@ Environment variables are configured in `.env`:
 - `AgentTracer`: OpenTelemetry wrapper for agent operations
 - `LangfuseTracer`: Langfuse wrapper for LLM observability
 - Supports: Console, OTLP, Jaeger, and Langfuse exporters
-- Traces: Agent runs, reasoning phases, LLM calls, tool executions
-- See [docs/TELEMETRY.md](docs/TELEMETRY.md) and [docs/LANGFUSE_INTEGRATION.md](docs/LANGFUSE_INTEGRATION.md)
+- Traces: Agent runs, reasoning phases, LLM calls, tool executions, context updates
+- **New**: Enhanced tracing of tool result feedback loop with explicit context updates
+- See [docs/TELEMETRY.md](docs/TELEMETRY.md), [docs/LANGFUSE_INTEGRATION.md](docs/LANGFUSE_INTEGRATION.md), and [docs/TELEMETRY_IMPROVEMENTS.md](docs/TELEMETRY_IMPROVEMENTS.md)
 
 **FastAPI Application** (`src/app.py`):
 - `/agent/query`: Main endpoint for agent queries

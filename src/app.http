@@ -83,6 +83,17 @@ Content-Type: application/json
     "session_id": "abc"
 }
 
+### TEST QUERY WITH VECTOR STORE
+POST http://localhost:8000/agent/query
+Content-Type: application/json
+
+{
+    "query": "why kind of whales are mentioned?",
+    "tools": true,
+    "stream": false,
+    "session_id": "abc"
+}
+
 ### TEST QUERY WITH ENTITIES SEARCH
 POST http://localhost:8000/agent/query
 Content-Type: application/json

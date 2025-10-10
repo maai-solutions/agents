@@ -9,6 +9,15 @@ from collections import deque
 import tiktoken
 from loguru import logger
 
+# Import telemetry support
+try:
+    from ..telemetry import AgentTracer, LangfuseTracer
+    TELEMETRY_AVAILABLE = True
+except ImportError:
+    TELEMETRY_AVAILABLE = False
+    AgentTracer = None
+    LangfuseTracer = None
+
 
 @dataclass
 class MemoryEntry:
@@ -181,7 +190,8 @@ class MemoryManager:
         summary_threshold_tokens: int = 2048,
         llm: Optional[Any] = None,
         model: Optional[str] = None,
-        encoding_name: str = "cl100k_base"
+        encoding_name: str = "cl100k_base",
+        tracer: Optional[Any] = None
     ):
         """Initialize memory manager.
 
@@ -192,6 +202,7 @@ class MemoryManager:
             llm: Language model for summarization (OpenAI client recommended)
             model: Model name for OpenAI client (e.g., "gpt-3.5-turbo", "gemma3:27b")
             encoding_name: Tokenizer encoding to use
+            tracer: Optional telemetry tracer (AgentTracer or LangfuseTracer)
         """
         self.backend = backend
         self.max_context_tokens = max_context_tokens
@@ -199,6 +210,7 @@ class MemoryManager:
         self.llm = llm
         self.model = model or "gpt-3.5-turbo"
         self.summary: Optional[str] = None
+        self.tracer = tracer
 
         # Initialize tokenizer
         try:
@@ -237,17 +249,29 @@ class MemoryManager:
             importance: Importance score (0.0 to 1.0)
             entry_type: Type of memory entry
         """
-        entry = MemoryEntry(
-            content=content,
-            metadata=metadata or {},
-            importance=importance,
-            entry_type=entry_type
-        )
-        self.backend.add(entry)
+        # Trace memory addition
+        if self.tracer:
+            span_ctx = self._trace_memory_operation("add_memory", {"entry_type": entry_type, "importance": importance})
+        else:
+            from contextlib import nullcontext
+            span_ctx = nullcontext()
 
-        # Check if we need to summarize
-        if self._should_summarize():
-            self._create_summary()
+        with span_ctx:
+            entry = MemoryEntry(
+                content=content,
+                metadata=metadata or {},
+                importance=importance,
+                entry_type=entry_type
+            )
+            self.backend.add(entry)
+
+            # Record memory stats
+            if self.tracer:
+                self._record_memory_stats()
+
+            # Check if we need to summarize
+            if self._should_summarize():
+                self._create_summary()
 
     def _should_summarize(self) -> bool:
         """Check if summarization is needed based on token count."""
@@ -308,6 +332,56 @@ class MemoryManager:
         except Exception as e:
             logger.exception(f"[MEMORY] Failed to create summary: {e}")
 
+    def _trace_memory_operation(self, operation: str, attributes: Dict[str, Any]):
+        """Create a trace span for memory operation.
+
+        Args:
+            operation: Operation name (add_memory, get_context, search, etc.)
+            attributes: Operation attributes
+
+        Returns:
+            Span context manager
+        """
+        if not self.tracer:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Support both AgentTracer (OpenTelemetry) and LangfuseTracer
+        if hasattr(self.tracer, 'tracer') and self.tracer.tracer:
+            # AgentTracer (OpenTelemetry)
+            return self.tracer.tracer.start_as_current_span(
+                f"memory.{operation}",
+                attributes={f"memory.{k}": v for k, v in attributes.items()}
+            )
+        elif hasattr(self.tracer, 'client') and self.tracer.client:
+            # LangfuseTracer
+            return self.tracer.client.start_as_current_span(
+                name=f"memory_{operation}",
+                metadata=attributes
+            )
+        else:
+            from contextlib import nullcontext
+            return nullcontext()
+
+    def _record_memory_stats(self):
+        """Record current memory statistics to telemetry."""
+        if not self.tracer:
+            return
+
+        stats = self.get_memory_stats()
+
+        # Support both AgentTracer and LangfuseTracer
+        if hasattr(self.tracer, 'set_attribute'):
+            # AgentTracer (OpenTelemetry)
+            for key, value in stats.items():
+                self.tracer.set_attribute(f"memory.{key}", value)
+        elif hasattr(self.tracer, 'client') and self.tracer.client:
+            # LangfuseTracer - update metadata
+            try:
+                self.tracer.client.update_current_trace(metadata={"memory_stats": stats})
+            except:
+                pass
+
     def get_context(
         self,
         max_tokens: Optional[int] = None,
@@ -324,45 +398,61 @@ class MemoryManager:
         Returns:
             Formatted context string
         """
-        if max_tokens is None:
-            max_tokens = self.max_context_tokens
-
-        context_parts = []
-        current_tokens = 0
-
-        # Add summary if available and requested
-        if include_summary and self.summary:
-            summary_text = f"=== Summary of Earlier Conversation ===\n{self.summary}\n\n"
-            summary_tokens = self.count_tokens(summary_text)
-            if summary_tokens < max_tokens * 0.3:  # Use max 30% for summary
-                context_parts.append(summary_text)
-                current_tokens += summary_tokens
-
-        # Get relevant memories
-        if query:
-            # Semantic search for relevant memories
-            memories = self.backend.search(query, limit=20)
+        # Trace context retrieval
+        if self.tracer:
+            span_ctx = self._trace_memory_operation("get_context", {
+                "max_tokens": max_tokens or self.max_context_tokens,
+                "include_summary": include_summary,
+                "has_query": query is not None
+            })
         else:
-            # Get recent memories
-            memories = self.backend.get_recent(limit=50)
+            from contextlib import nullcontext
+            span_ctx = nullcontext()
 
-        # Add memories until we hit token limit
-        context_parts.append("=== Recent Context ===\n")
+        with span_ctx:
+            if max_tokens is None:
+                max_tokens = self.max_context_tokens
 
-        for entry in reversed(memories):  # Most recent last
-            entry_text = f"[{entry.timestamp.strftime('%H:%M:%S')}] {entry.content}\n"
-            entry_tokens = self.count_tokens(entry_text)
+            context_parts = []
+            current_tokens = 0
 
-            if current_tokens + entry_tokens > max_tokens:
-                break
+            # Add summary if available and requested
+            if include_summary and self.summary:
+                summary_text = f"=== Summary of Earlier Conversation ===\n{self.summary}\n\n"
+                summary_tokens = self.count_tokens(summary_text)
+                if summary_tokens < max_tokens * 0.3:  # Use max 30% for summary
+                    context_parts.append(summary_text)
+                    current_tokens += summary_tokens
 
-            context_parts.append(entry_text)
-            current_tokens += entry_tokens
+            # Get relevant memories
+            if query:
+                # Semantic search for relevant memories
+                memories = self.backend.search(query, limit=20)
+            else:
+                # Get recent memories
+                memories = self.backend.get_recent(limit=50)
 
-        context = "".join(context_parts)
-        logger.debug(f"[MEMORY] Generated context with {current_tokens} tokens")
+            # Add memories until we hit token limit
+            context_parts.append("=== Recent Context ===\n")
 
-        return context
+            for entry in reversed(memories):  # Most recent last
+                entry_text = f"[{entry.timestamp.strftime('%H:%M:%S')}] {entry.content}\n"
+                entry_tokens = self.count_tokens(entry_text)
+
+                if current_tokens + entry_tokens > max_tokens:
+                    break
+
+                context_parts.append(entry_text)
+                current_tokens += entry_tokens
+
+            context = "".join(context_parts)
+            logger.debug(f"[MEMORY] Generated context with {current_tokens} tokens")
+
+            # Record final token count
+            if self.tracer:
+                self.tracer.set_attribute("memory.context_tokens", current_tokens)
+
+            return context
 
     def search_memories(self, query: str, limit: int = 5) -> List[MemoryEntry]:
         """Search for relevant memories.
@@ -374,7 +464,21 @@ class MemoryManager:
         Returns:
             List of matching memory entries
         """
-        return self.backend.search(query, limit)
+        # Trace search operation
+        if self.tracer:
+            span_ctx = self._trace_memory_operation("search", {"query_length": len(query), "limit": limit})
+        else:
+            from contextlib import nullcontext
+            span_ctx = nullcontext()
+
+        with span_ctx:
+            results = self.backend.search(query, limit)
+
+            # Record search results count
+            if self.tracer:
+                self.tracer.set_attribute("memory.search_results", len(results))
+
+            return results
 
     def clear_memory(self) -> None:
         """Clear all memories and summary."""
@@ -426,7 +530,8 @@ def create_memory_manager(
     summary_threshold_tokens: int = 2048,
     llm: Optional[Any] = None,
     model: Optional[str] = None,
-    max_size: Optional[int] = None
+    max_size: Optional[int] = None,
+    tracer: Optional[Any] = None
 ) -> MemoryManager:
     """Factory function to create a memory manager.
 
@@ -437,19 +542,24 @@ def create_memory_manager(
         llm: Language model for summarization (OpenAI client recommended)
         model: Model name for OpenAI client (e.g., "gpt-3.5-turbo", "gemma3:27b")
         max_size: Maximum number of memories (for in_memory backend)
+        tracer: Optional telemetry tracer (AgentTracer or LangfuseTracer)
 
     Returns:
         Configured MemoryManager instance
 
     Example:
         from openai import OpenAI
+        from linus.agents.telemetry import initialize_telemetry
 
         llm = OpenAI(base_url="http://localhost:11434/v1", api_key="not-needed")
+        tracer = initialize_telemetry(exporter_type="langfuse", enabled=True)
+
         memory = create_memory_manager(
             backend_type="in_memory",
             llm=llm,
             model="gemma3:27b",
-            max_context_tokens=4096
+            max_context_tokens=4096,
+            tracer=tracer
         )
     """
     if backend_type == "in_memory":
@@ -464,5 +574,6 @@ def create_memory_manager(
         max_context_tokens=max_context_tokens,
         summary_threshold_tokens=summary_threshold_tokens,
         llm=llm,
-        model=model
+        model=model,
+        tracer=tracer
     )

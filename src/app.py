@@ -170,7 +170,8 @@ async def lifespan(app: FastAPI):
             top_k=settings.llm_top_k,
             tools=tools,
             verbose=settings.agent_verbose,
-            tracer=tracer
+            tracer=tracer,
+            enable_memory=True
         )
         
         logger.info(f"Agent initialized with {len(tools)} tools")

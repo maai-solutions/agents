@@ -26,6 +26,9 @@ opentelemetry-instrumentation-openai
 # Langfuse observability
 langfuse
 
+# System metrics (optional - for memory/CPU tracking in telemetry)
+# psutil
+
 # MCP (Model Context Protocol) integration
 mcp
 

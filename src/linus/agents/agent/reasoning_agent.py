@@ -265,14 +265,28 @@ Response:"""
             # Add memory context if available
             if self.memory_manager:
                 memory_tokens = int(self.memory_manager.max_context_tokens * self.memory_context_ratio)
+                
+                # Create a contextual query that evolves with the conversation
+                # On first iteration, use the original question
+                # On subsequent iterations, include context from recent execution results
+                if iteration == 1:
+                    memory_query = input_text
+                else:
+                    # Use the most recent execution results to create a more specific query
+                    recent_context = input_text
+                    if execution_history:
+                        recent_tasks = [item['task'] for item in execution_history[-2:]]  # Last 2 tasks
+                        recent_context = f"{input_text} | Recent work: {' | '.join(recent_tasks)}"
+                    memory_query = recent_context
+                
                 memory_context = self.memory_manager.get_context(
                     max_tokens=memory_tokens,
                     include_summary=True,
-                    query=input_text
+                    query=memory_query
                 )
                 if memory_context:
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
-                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
+                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context with query: {memory_query[:100]}...")
 
             # Add state context if available
             state_data = self.state.get_all()
@@ -286,7 +300,28 @@ Response:"""
                 ])
                 context = context + history_context
 
-            reasoning_result = self._reasoning_call(context)
+                # Trace context being passed to reasoning
+                self.tracer.add_event("reasoning_input_with_history", {
+                    "iteration": iteration,
+                    "has_execution_history": True,
+                    "history_items_count": len(execution_history),
+                    "context_preview": context[-500:] if len(context) > 500 else context,
+                    "context_length": len(context)
+                })
+
+            # Trace the reasoning phase with iteration context
+            with self.tracer.trace_reasoning_phase(input_text=context, iteration=iteration) as reasoning_span:
+                reasoning_result = self._reasoning_call(context)
+
+                # Update reasoning span with results for Langfuse
+                if hasattr(reasoning_span, 'update'):
+                    reasoning_span.update(
+                        output={
+                            "has_sufficient_info": reasoning_result.has_sufficient_info,
+                            "tasks_planned": len(reasoning_result.tasks),
+                            "reasoning": reasoning_result.reasoning[:200]
+                        }
+                    )
             logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
 
             # If no sufficient info and this is the first iteration, exit early
@@ -328,6 +363,14 @@ Response:"""
 
                     # Update context with results for subsequent tasks
                     context = f"{context}\n\nLatest result: {task_result}"
+
+                    # Trace context update for visibility
+                    self.tracer.add_event("context_updated_with_tool_result", {
+                        "tool_name": task.tool_name,
+                        "result_preview": str(task_result)[:200],
+                        "context_length": len(context)
+                    })
+                    logger.debug(f"[RUN] Context updated with tool result: {str(task_result)[:200]}")
                 else:
                     # Direct LLM response without tool
                     response = self._generate_response(task.description, context)
@@ -343,15 +386,37 @@ Response:"""
 
                     context = f"{context}\n\nLatest result: {response}"
 
+                    # Trace context update
+                    self.tracer.add_event("context_updated_with_llm_response", {
+                        "response_preview": response[:200],
+                        "context_length": len(context)
+                    })
+                    logger.debug(f"[RUN] Context updated with LLM response: {response[:200]}")
+
             # Phase 3: Check if task is complete
             completion_status = self._check_completion(input_text, execution_history)
             is_complete = completion_status["is_complete"]
 
             logger.info(f"[RUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
 
+            # Trace completion check result
+            self.tracer.add_event("task_completion_checked", {
+                "is_complete": is_complete,
+                "iteration": iteration,
+                "reasoning": completion_status['reasoning'][:200]
+            })
+
             if not is_complete and iteration < self.max_iterations:
                 logger.info(f"[RUN] Task not complete. Next action: {completion_status['next_action']}")
                 logger.info(f"[RUN] Missing steps: {completion_status['missing_steps']}")
+
+                # Trace iteration continuation
+                self.tracer.add_event("continuing_to_next_iteration", {
+                    "next_iteration": iteration + 1,
+                    "next_action": completion_status['next_action'],
+                    "missing_steps": completion_status['missing_steps'],
+                    "accumulated_context_length": len(context)
+                })
                 # Loop continues with updated context
             elif not is_complete and iteration >= self.max_iterations:
                 logger.warning(f"[RUN] Max iterations ({self.max_iterations}) reached without completion")
@@ -474,14 +539,28 @@ Response:"""
             # Add memory context if available
             if self.memory_manager:
                 memory_tokens = int(self.memory_manager.max_context_tokens * self.memory_context_ratio)
+                
+                # Create a contextual query that evolves with the conversation
+                # On first iteration, use the original question
+                # On subsequent iterations, include context from recent execution results
+                if iteration == 1:
+                    memory_query = input_text
+                else:
+                    # Use the most recent execution results to create a more specific query
+                    recent_context = input_text
+                    if execution_history:
+                        recent_tasks = [item['task'] for item in execution_history[-2:]]  # Last 2 tasks
+                        recent_context = f"{input_text} | Recent work: {' | '.join(recent_tasks)}"
+                    memory_query = recent_context
+                
                 memory_context = self.memory_manager.get_context(
                     max_tokens=memory_tokens,
                     include_summary=True,
-                    query=input_text
+                    query=memory_query
                 )
                 if memory_context:
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
-                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
+                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context with query: {memory_query[:100]}...")
 
             # Add state context if available
             state_data = self.state.get_all()
@@ -495,7 +574,28 @@ Response:"""
                 ])
                 context = context + history_context
 
-            reasoning_result = await self._areasoning_call(context)
+                # Trace context being passed to reasoning
+                self.tracer.add_event("reasoning_input_with_history", {
+                    "iteration": iteration,
+                    "has_execution_history": True,
+                    "history_items_count": len(execution_history),
+                    "context_preview": context[-500:] if len(context) > 500 else context,
+                    "context_length": len(context)
+                })
+
+            # Trace the reasoning phase with iteration context
+            with self.tracer.trace_reasoning_phase(input_text=context, iteration=iteration) as reasoning_span:
+                reasoning_result = await self._areasoning_call(context)
+
+                # Update reasoning span with results for Langfuse
+                if hasattr(reasoning_span, 'update'):
+                    reasoning_span.update(
+                        output={
+                            "has_sufficient_info": reasoning_result.has_sufficient_info,
+                            "tasks_planned": len(reasoning_result.tasks),
+                            "reasoning": reasoning_result.reasoning[:200]
+                        }
+                    )
             logger.debug(f"[ARUN] Reasoning result: {reasoning_result}")
 
             # If no sufficient info and this is the first iteration, exit early
@@ -537,6 +637,14 @@ Response:"""
 
                     # Update context with results for subsequent tasks
                     context = f"{context}\n\nLatest result: {task_result}"
+
+                    # Trace context update for visibility
+                    self.tracer.add_event("context_updated_with_tool_result", {
+                        "tool_name": task.tool_name,
+                        "result_preview": str(task_result)[:200],
+                        "context_length": len(context)
+                    })
+                    logger.debug(f"[ARUN] Context updated with tool result: {str(task_result)[:200]}")
                 else:
                     # Direct LLM response without tool
                     response = await self._agenerate_response(task.description, context)
@@ -552,15 +660,37 @@ Response:"""
 
                     context = f"{context}\n\nLatest result: {response}"
 
+                    # Trace context update
+                    self.tracer.add_event("context_updated_with_llm_response", {
+                        "response_preview": response[:200],
+                        "context_length": len(context)
+                    })
+                    logger.debug(f"[ARUN] Context updated with LLM response: {response[:200]}")
+
             # Phase 3: Check if task is complete
             completion_status = await self._acheck_completion(input_text, execution_history)
             is_complete = completion_status["is_complete"]
 
             logger.info(f"[ARUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
 
+            # Trace completion check result
+            self.tracer.add_event("task_completion_checked", {
+                "is_complete": is_complete,
+                "iteration": iteration,
+                "reasoning": completion_status['reasoning'][:200]
+            })
+
             if not is_complete and iteration < self.max_iterations:
                 logger.info(f"[ARUN] Task not complete. Next action: {completion_status['next_action']}")
                 logger.info(f"[ARUN] Missing steps: {completion_status['missing_steps']}")
+
+                # Trace iteration continuation
+                self.tracer.add_event("continuing_to_next_iteration", {
+                    "next_iteration": iteration + 1,
+                    "next_action": completion_status['next_action'],
+                    "missing_steps": completion_status['missing_steps'],
+                    "accumulated_context_length": len(context)
+                })
                 # Loop continues with updated context
             elif not is_complete and iteration >= self.max_iterations:
                 logger.warning(f"[ARUN] Max iterations ({self.max_iterations}) reached without completion")
@@ -776,6 +906,12 @@ Response:"""
 
             # Add telemetry for tool result
             self.tracer.set_attribute("tool.result", str(result)[:500])
+            self.tracer.add_event("tool_execution_completed", {
+                "tool_name": task.tool_name,
+                "result_length": len(str(result)),
+                "status": "success"
+            })
+
             task.completed = True
             task.result = result
 
@@ -1176,6 +1312,14 @@ Response:"""
             result = await loop.run_in_executor(None, tool.run, tool_args)
 
             logger.info(f"[ASYNC-EXECUTION] Tool result: {result}")
+
+            # Add telemetry for tool execution completion
+            self.tracer.add_event("tool_execution_completed", {
+                "tool_name": task.tool_name,
+                "result_length": len(str(result)),
+                "status": "success"
+            })
+
             task.completed = True
             task.result = result
 
