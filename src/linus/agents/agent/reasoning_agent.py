@@ -6,7 +6,6 @@ import re
 import time
 import asyncio
 from pydantic import BaseModel
-from loguru import logger
 from openai import OpenAI, AsyncOpenAI
 
 from linus.agents.agent.memory import MemoryManager
@@ -14,8 +13,10 @@ from linus.agents.agent.memory import MemoryManager
 from .base import Agent
 from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse
 from .tool_base import BaseTool
+from .config import AgentParams, MemoryConfig, LLMConfig
 from ..graph.state import SharedState
-from ..telemetry import get_tracer, AgentTracer, trace_method
+from ..di import ILogger, ITelemetry
+from ..telemetry import trace_method
 
 # Try to import rich for enhanced logging
 try:
@@ -55,7 +56,10 @@ class ReasoningAgent(Agent):
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         api_base: Optional[str] = None,
-        use_json_format: bool = False
+        use_json_format: bool = False,
+        logger: Optional[ILogger] = None,
+        telemetry: Optional[ITelemetry] = None,
+        agent_name: Optional[str] = None,
     ):
         """Initialize the reasoning agent.
 
@@ -71,14 +75,17 @@ class ReasoningAgent(Agent):
             max_iterations: Maximum number of reasoning-execution loops before stopping
             memory_manager: Optional memory manager for context persistence
             memory_context_ratio: Ratio of context window to use for memory (0.0 to 1.0)
-            temperature: Sampling temperature for LLM calls
-            max_tokens: Maximum tokens to generate in completion
-            top_p: Nucleus sampling parameter
-            top_k: Top-k sampling parameter
-            api_base: Optional API base URL for reference
+            temperature: Sampling temperature for LLM calls (deprecated, use agent_params)
+            max_tokens: Maximum tokens to generate in completion (deprecated, use agent_params)
+            top_p: Nucleus sampling parameter (deprecated, use agent_params)
+            top_k: Top-k sampling parameter (deprecated, use agent_params)
+            api_base: Optional API base URL for reference (deprecated, use agent_params.llm_config)
             use_json_format: Whether to use response_format={"type": "json_object"} (not all models support this)
+            logger: Optional logger instance (uses DI container if None)
+            telemetry: Optional telemetry instance (uses DI container if None)
+            agent_name: Optional name for the agent (used in hierarchical tracing)
         """
-        super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager)
+        super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager, logger, telemetry, agent_name)
         self.reasoning_prompt = self._create_reasoning_prompt()
         self.execution_prompt = self._create_execution_prompt()
         self.completion_check_prompt = self._create_completion_check_prompt()
@@ -86,16 +93,16 @@ class ReasoningAgent(Agent):
         self.current_metrics: Optional[AgentMetrics] = None
         self.memory_context_ratio = max(0.0, min(1.0, memory_context_ratio))  # Clamp to 0-1
 
-        # LLM generation parameters
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.top_k = top_k
+        # Create default configs if not provided
+        self.memory_config = MemoryConfig()
+        self.llm_config = LLMConfig(api_base=api_base or "http://localhost:11434/v1", model=model, api_key="not-needed")
+
         self.api_base = api_base
         self.use_json_format = use_json_format
-
-        # Telemetry tracer
-        self.tracer = get_tracer()
 
     def _get_generation_kwargs(self) -> Dict[str, Any]:
         """Build kwargs for LLM generation with configured parameters.
@@ -197,10 +204,14 @@ Execution History:
 Based on the original request and the execution history, determine if the task has been completed successfully.
 
 IMPORTANT GUIDELINES:
-- If a tool returned no results or empty data, the task is NOT complete unless all reasonable alternatives have been tried
-- Suggest trying alternative tools or different query approaches when tools return no results
-- Only mark as complete when the user's request has been successfully answered or when all reasonable attempts have been exhausted
-- Be persistent: if one approach didn't work, plan to try another approach rather than giving up
+- If a tool returned relevant information or search results, consider the task COMPLETE even if the results are partial
+- Focus on whether we have SOME information to answer the user's question, not perfect information
+- Only mark as incomplete if:
+  1. All tools returned errors or empty results, OR
+  2. The results are completely unrelated to the user's question, OR
+  3. This is the first iteration and we need to try at least one tool
+- Avoid infinite loops: if we've tried 3+ times with similar approaches, mark as complete with what we have
+- Do NOT repeat the same tool with the same query more than twice
 
 Respond in the following JSON format:
 {{
@@ -226,7 +237,7 @@ Response:"""
         input_text = self._validate_and_convert_input(input_data)
 
         # Start tracing for agent run (use async with for async compatibility)
-        async with self.tracer.trace_agent_run(user_input=input_text, agent_type="ReasoningAgent") as trace:
+        async with self.telemetry.trace_agent_run(user_input=input_text, agent_type="ReasoningAgent", agent_name=self.agent_name) as trace:
             return await self._run_with_trace(input_text, return_metrics, trace)
 
     async def _run_with_trace(self, input_text: str, return_metrics: bool, trace: Any = None) -> Union[str, BaseModel, AgentResponse]:
@@ -235,7 +246,7 @@ Response:"""
         metrics = AgentMetrics()
         self.current_metrics = metrics
         start_time = time.time()
-        logger.info(f"[RUN] Starting task: {input_text}")
+        self.logger.info(f"[RUN] Starting task: {input_text}")
 
         # Store user input in memory
         if self.memory_manager:
@@ -258,7 +269,7 @@ Response:"""
             # Update metrics
             if self.current_metrics:
                 self.current_metrics.total_iterations = iteration
-            logger.info(f"[RUN] === Iteration {iteration}/{self.max_iterations} ===")
+            self.logger.info(f"[RUN] === Iteration {iteration}/{self.max_iterations} ===")
 
             # Phase 1: Reasoning
             # Build context from previous iterations and memory
@@ -274,7 +285,7 @@ Response:"""
                 )
                 if memory_context:
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
-                    logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
+                    self.logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
 
             # Add state context if available
             state_data = self.state.get_all()
@@ -289,20 +300,20 @@ Response:"""
                 context = context + history_context
 
             reasoning_result = await self._reasoning_call(context, iteration)
-            logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
+            self.logger.debug(f"[RUN] Reasoning result: {reasoning_result}")
 
             # If no sufficient info and this is the first iteration, exit early
             # But allow retries in subsequent iterations with updated context
             if not reasoning_result.has_sufficient_info and iteration == 1:
                 result = f"I need more information to complete this task. {reasoning_result.reasoning}"
-                logger.warning(f"[RUN] Insufficient information: {reasoning_result.reasoning}")
+                self.logger.warning(f"[RUN] Insufficient information: {reasoning_result.reasoning}")
 
                 # Return immediately only if there are no tasks planned
                 if not reasoning_result.tasks:
                     return self._format_output(result)
 
                 # If there are tasks planned, continue to execute them
-                logger.info(f"[RUN] Proceeding with {len(reasoning_result.tasks)} planned tasks despite insufficient info flag")
+                self.logger.info(f"[RUN] Proceeding with {len(reasoning_result.tasks)} planned tasks despite insufficient info flag")
 
             # Phase 2: Execute planned tasks
             iteration_results = []
@@ -312,7 +323,7 @@ Response:"""
                     tool_name=task_data.get("tool_name")
                 )
 
-                logger.info(f"[RUN] Executing task: {task.description}")
+                self.logger.info(f"[RUN] Executing task: {task.description}")
 
                 if task.tool_name:
                     # Generate tool arguments and execute
@@ -349,14 +360,14 @@ Response:"""
             completion_status = await self._check_completion(input_text, execution_history)
             is_complete = completion_status["is_complete"]
 
-            logger.info(f"[RUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
+            self.logger.info(f"[RUN] Completion check - Complete: {is_complete}, Reason: {completion_status['reasoning']}")
 
             if not is_complete and iteration < self.max_iterations:
-                logger.info(f"[RUN] Task not complete. Next action: {completion_status['next_action']}")
-                logger.info(f"[RUN] Missing steps: {completion_status['missing_steps']}")
+                self.logger.info(f"[RUN] Task not complete. Next action: {completion_status['next_action']}")
+                self.logger.info(f"[RUN] Missing steps: {completion_status['missing_steps']}")
                 # Loop continues with updated context
             elif not is_complete and iteration >= self.max_iterations:
-                logger.warning(f"[RUN] Max iterations ({self.max_iterations}) reached without completion")
+                self.logger.warning(f"[RUN] Max iterations ({self.max_iterations}) reached without completion")
                 break
 
         # Calculate final metrics
@@ -367,9 +378,9 @@ Response:"""
 
         # Task completed successfully
         if is_complete:
-            logger.info(f"[RUN] Task completed successfully in {iteration} iteration(s)")
+            self.logger.info(f"[RUN] Task completed successfully in {iteration} iteration(s)")
         else:
-            logger.warning(f"[RUN] Task incomplete after {iteration} iteration(s)")
+            self.logger.warning(f"[RUN] Task incomplete after {iteration} iteration(s)")
 
         final_result = await self._format_final_response_with_history(input_text, execution_history, completion_status)
 
@@ -392,7 +403,7 @@ Response:"""
 
             # Log memory stats
             mem_stats = self.memory_manager.get_memory_stats()
-            logger.debug(f"[MEMORY] Stats: {mem_stats}")
+            self.logger.debug(f"[MEMORY] Stats: {mem_stats}")
 
         # Update trace with final output and status
         if trace and hasattr(trace, 'update'):
@@ -407,17 +418,17 @@ Response:"""
             )
 
         # Record metrics in telemetry
-        self.tracer.record_metrics(metrics.to_dict())
+        self.telemetry.record_metrics(metrics.to_dict())
 
         # Flush traces to ensure they're sent to Langfuse
-        if hasattr(self.tracer, 'flush'):
-            self.tracer.flush()
+        if hasattr(self.telemetry, 'flush'):
+            self.telemetry.flush()
 
         # Log final metrics with rich formatting if available
         if RICH_AVAILABLE and _console:
             self._display_metrics_rich(metrics)
         else:
-            logger.info(f"[METRICS] {metrics.to_dict()}")
+            self.logger.info(f"[METRICS] {metrics.to_dict()}")
 
         # Return based on return_metrics flag
         if return_metrics:
@@ -441,8 +452,8 @@ Response:"""
         Returns:
             Formatted final response
         """
-        logger.debug(f"[FINAL] Original request: {original_request}")
-        logger.debug(f"[FINAL] Results: {results}")
+        self.logger.debug(f"[FINAL] Original request: {original_request}")
+        self.logger.debug(f"[FINAL] Results: {results}")
 
         if len(results) == 1:
             return results[0]
@@ -453,7 +464,7 @@ Response:"""
             for i, result in enumerate(results)
         ])
 
-        logger.debug(f"[FINAL] Combined results: {combined}")
+        self.logger.debug(f"[FINAL] Combined results: {combined}")
 
         # Use LLM to create a coherent final response
         messages = [
@@ -466,7 +477,7 @@ Response:"""
             **self._get_generation_kwargs()
         )
         response_text = response.choices[0].message.content
-        logger.debug(f"[FINAL] Final response: {response_text}")
+        self.logger.debug(f"[FINAL] Final response: {response_text}")
 
         # Track metrics
         self._update_token_usage(response)
@@ -485,9 +496,9 @@ Response:"""
         Returns:
             Formatted final response
         """
-        logger.debug(f"[FINAL-HISTORY] Formatting response for: {input_text}")
-        logger.debug(f"[FINAL-HISTORY] Execution history: {len(execution_history)} items")
-        logger.debug(f"[FINAL-HISTORY] Completion status: {completion_status}")
+        self.logger.debug(f"[FINAL-HISTORY] Formatting response for: {input_text}")
+        self.logger.debug(f"[FINAL-HISTORY] Execution history: {len(execution_history)} items")
+        self.logger.debug(f"[FINAL-HISTORY] Completion status: {completion_status}")
 
         # Extract results from execution history
         task_results = []
@@ -502,11 +513,7 @@ Response:"""
             else:
                 return "I apologize, but I was unable to find relevant information to answer your question."
 
-        # If we have only one result, return it directly
-        if len(task_results) == 1:
-            return task_results[0]
-
-        # Combine multiple results with context
+        # Combine multiple results with context (even for single result, we want LLM processing)
         combined_results = "\n\n".join([
             f"Finding {i+1}: {result}"
             for i, result in enumerate(task_results)
@@ -537,12 +544,12 @@ Please provide a comprehensive answer to the original question based on these fi
             
             # Track metrics
             self._update_token_usage(response)
-            
-            logger.debug(f"[FINAL-HISTORY] Generated response: {response_text[:200]}...")
+
+            self.logger.debug(f"[FINAL-HISTORY] Generated response: {response_text[:200]}...")
             return response_text
-            
+
         except Exception as e:
-            logger.exception(f"[FINAL-HISTORY] Error generating final response: {e}")
+            self.logger.exception(f"[FINAL-HISTORY] Error generating final response: {e}")
             # Fallback to simple concatenation
             return f"Based on my research:\n\n{combined_results}"
 
@@ -558,13 +565,13 @@ Please provide a comprehensive answer to the original question based on these fi
             ReasoningResult containing the analysis and planned tasks
         """
         # Trace the reasoning phase
-        async with self.tracer.trace_reasoning_phase(input_text, iteration):
+        async with self.telemetry.trace_reasoning_phase(input_text, iteration):
             messages = [
                 {"role": "system", "content": self.reasoning_prompt},
                 {"role": "user", "content": input_text}
             ]
 
-            logger.debug(f"[REASONING] Input text: {input_text}")
+            self.logger.debug(f"[REASONING] Input text: {input_text}")
 
             # Try to force JSON response format if supported
             gen_kwargs = self._get_generation_kwargs()
@@ -573,18 +580,18 @@ Please provide a comprehensive answer to the original question based on these fi
             if self.use_json_format:
                 try:
                     gen_kwargs["response_format"] = {"type": "json_object"}
-                    logger.debug("[REASONING] Using response_format=json_object")
+                    self.logger.debug("[REASONING] Using response_format=json_object")
                 except Exception:
                     pass
 
             # Trace the LLM call within the reasoning phase
-            async with self.tracer.trace_llm_call(messages[1]["content"], self.model, "reasoning"):
+            async with self.telemetry.trace_llm_call(messages[1]["content"], self.model, "reasoning", llm_name=self.model):
                 response = await self.llm.chat.completions.create(
                     messages=messages,
                     **gen_kwargs
                 )
                 response_text = response.choices[0].message.content
-                logger.debug(f"[REASONING] Raw response: {response_text}")
+                self.logger.debug(f"[REASONING] Raw response: {response_text}")
 
                 # Extract usage if available
                 usage = None
@@ -609,31 +616,31 @@ Please provide a comprehensive answer to the original question based on these fi
                         tasks=response_data.get("tasks", []),
                         reasoning=response_data.get("reasoning", "")
                     )
-                    logger.debug(f"[REASONING] Parsed result: {result}")
+                    self.logger.debug(f"[REASONING] Parsed result: {result}")
 
                     # Update generation with parsed output WHILE still inside the context
-                    if hasattr(self.tracer, 'update_generation'):
+                    if hasattr(self.telemetry, 'update_generation'):
                         output_data = {
                             "has_sufficient_info": result.has_sufficient_info,
                             "reasoning": result.reasoning,
                             "tasks_count": len(result.tasks),
                             "tasks": result.tasks
                         }
-                        self.tracer.update_generation(output=output_data, usage=usage)
-                        logger.debug(f"[REASONING] Updated generation with parsed output")
+                        self.telemetry.update_generation(output=output_data, usage=usage)
+                        self.logger.debug(f"[REASONING] Updated generation with parsed output")
 
                 except (json.JSONDecodeError, KeyError) as e:
-                    logger.exception(f"[REASONING] Error parsing response: {e}")
-                    logger.error(f"[REASONING] Raw response was: {response_text[:500]}")
+                    self.logger.exception(f"[REASONING] Error parsing response: {e}")
+                    self.logger.error(f"[REASONING] Raw response was: {response_text[:500]}")
 
                     # Update generation with error
-                    if hasattr(self.tracer, 'update_generation'):
+                    if hasattr(self.telemetry, 'update_generation'):
                         error_output = {
                             "error": str(e),
                             "failed_to_parse": response_text[:500]
                         }
-                        self.tracer.update_generation(output=error_output, usage=usage)
-                        logger.debug(f"[REASONING] Updated generation with error")
+                        self.telemetry.update_generation(output=error_output, usage=usage)
+                        self.logger.debug(f"[REASONING] Updated generation with error")
 
                     result = ReasoningResult(
                         has_sufficient_info=False,
@@ -643,7 +650,7 @@ Please provide a comprehensive answer to the original question based on these fi
 
             # After LLM call completes, update the reasoning_phase span with the result
             # This must happen INSIDE the reasoning_phase context but AFTER the LLM context closes
-            if hasattr(self.tracer, 'client') and self.tracer.enabled:
+            if hasattr(self.telemetry, 'client') and self.telemetry.enabled:
                 try:
                     span_output = {
                         "has_sufficient_info": result.has_sufficient_info,
@@ -651,10 +658,10 @@ Please provide a comprehensive answer to the original question based on these fi
                         "tasks_count": len(result.tasks),
                         "tasks": result.tasks
                     }
-                    self.tracer.client.update_current_span(output=span_output)
-                    logger.debug(f"[REASONING] Updated reasoning_phase span with output")
+                    self.telemetry.client.update_current_span(output=span_output)
+                    self.logger.debug(f"[REASONING] Updated reasoning_phase span with output")
                 except Exception as e:
-                    logger.warning(f"[REASONING] Failed to update reasoning_phase span: {e}")
+                    self.logger.warning(f"[REASONING] Failed to update reasoning_phase span: {e}")
 
             # Track metrics (after LLM context closes)
             if self.current_metrics:
@@ -673,11 +680,11 @@ Please provide a comprehensive answer to the original question based on these fi
         Returns:
             The result of the tool execution
         """
-        logger.debug(f"[EXECUTION] Task: {task.description}")
-        logger.debug(f"[EXECUTION] Tool: {task.tool_name}")
+        self.logger.debug(f"[EXECUTION] Task: {task.description}")
+        self.logger.debug(f"[EXECUTION] Tool: {task.tool_name}")
 
         if task.tool_name not in self.tool_map:
-            logger.error(f"[EXECUTION] Tool not found: {task.tool_name}")
+            self.logger.error(f"[EXECUTION] Tool not found: {task.tool_name}")
             return f"Error: Tool '{task.tool_name}' not available"
 
         tool = self.tool_map[task.tool_name]
@@ -692,24 +699,24 @@ Please provide a comprehensive answer to the original question based on these fi
 
         # Execute the tool
         try:
-            logger.info(f"[EXECUTION] Executing {task.tool_name} with args: {tool_args}")
+            self.logger.info(f"[EXECUTION] Executing {task.tool_name} with args: {tool_args}")
 
             # Trace tool execution
-            async with self.tracer.trace_tool_execution(task.tool_name, tool_args) as tool_span:
+            async with self.telemetry.trace_tool_execution(task.tool_name, tool_args) as tool_span:
                 # Execute tool asynchronously
                 result = await tool.arun(tool_args)
 
-                logger.info(f"[EXECUTION] Tool result: {result}")
+                self.logger.info(f"[EXECUTION] Tool result: {result}")
                 task.completed = True
                 task.result = result
 
                 # Update tool span with result - for spans we can use update methods
-                if tool_span and hasattr(self.tracer, 'client'):
+                if tool_span and hasattr(self.telemetry, 'client'):
                     try:
                         # Update current span with output
-                        self.tracer.client.update_current_span(output=str(result))
+                        self.telemetry.client.update_current_span(output=str(result))
                     except Exception as e:
-                        logger.warning(f"Failed to update tool span: {e}")
+                        self.logger.warning(f"Failed to update tool span: {e}")
 
             # Track metrics
             if self.current_metrics:
@@ -718,7 +725,7 @@ Please provide a comprehensive answer to the original question based on these fi
 
             return str(result)
         except Exception as e:
-            logger.exception(f"[EXECUTION] Tool execution failed: {e}")
+            self.logger.exception(f"[EXECUTION] Tool execution failed: {e}")
             task.completed = False
             if self.current_metrics:
                 self.current_metrics.tool_executions += 1
@@ -742,7 +749,7 @@ Please provide a comprehensive answer to the original question based on these fi
             if hasattr(tool.args_schema, 'model_json_schema'):
                 tool_schema = tool.args_schema.model_json_schema()
             else:
-                logger.warning(f"[TOOL-ARGS] Tool {tool.name} has args_schema without model_json_schema()")
+                self.logger.warning(f"[TOOL-ARGS] Tool {tool.name} has args_schema without model_json_schema()")
                 # Fallback to input_schema_dict if available
                 if hasattr(tool, 'input_schema_dict'):
                     tool_schema = tool.input_schema_dict
@@ -760,14 +767,14 @@ Please provide a comprehensive answer to the original question based on these fi
             {"role": "user", "content": prompt}
         ]
 
-        logger.debug(f"[TOOL-ARGS] Generating args for {tool.name}")
+        self.logger.debug(f"[TOOL-ARGS] Generating args for {tool.name}")
 
         # Use lower temperature for more consistent JSON generation
         kwargs = self._get_generation_kwargs()
         kwargs["temperature"] = min(0.3, kwargs.get("temperature", 0.7))
 
         # Trace the tool argument generation LLM call
-        async with self.tracer.trace_llm_call(prompt, self.model, "tool_args"):
+        async with self.telemetry.trace_llm_call(prompt, self.model, "tool_args", llm_name=self.model):
             response = await self.llm.chat.completions.create(
                 messages=messages,
                 **kwargs
@@ -793,7 +800,7 @@ Please provide a comprehensive answer to the original question based on these fi
                 # Strategy 1: Try to extract JSON from markdown code blocks
                 code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
                 if code_block_match:
-                    logger.debug(f"[TOOL-ARGS] Found JSON in markdown code block")
+                    self.logger.debug(f"[TOOL-ARGS] Found JSON in markdown code block")
                     args = json.loads(code_block_match.group(1))
                 else:
                     # Strategy 2: Extract first JSON object from response
@@ -804,27 +811,27 @@ Please provide a comprehensive answer to the original question based on these fi
                         # Strategy 3: Try parsing the entire response as JSON
                         args = json.loads(response_text.strip())
 
-                logger.debug(f"[TOOL-ARGS] Generated args: {args}")
+                self.logger.debug(f"[TOOL-ARGS] Generated args: {args}")
 
                 # Update generation with parsed arguments as structured output
                 # MUST be called inside the trace_llm_call context
-                if hasattr(self.tracer, 'update_generation'):
-                    self.tracer.update_generation(output=args, usage=usage)
-                    logger.debug(f"[TOOL-ARGS] Updated generation with parsed args: {args}")
+                if hasattr(self.telemetry, 'update_generation'):
+                    self.telemetry.update_generation(output=args, usage=usage)
+                    self.logger.debug(f"[TOOL-ARGS] Updated generation with parsed args: {args}")
 
             except (json.JSONDecodeError, KeyError) as e:
-                logger.exception(f"[TOOL-ARGS] Error parsing arguments: {e}")
-                logger.error(f"[TOOL-ARGS] Failed to parse response: {response_text}")
+                self.logger.exception(f"[TOOL-ARGS] Error parsing arguments: {e}")
+                self.logger.error(f"[TOOL-ARGS] Failed to parse response: {response_text}")
 
                 # Update generation with error information
                 # MUST be called inside the trace_llm_call context
-                if hasattr(self.tracer, 'update_generation'):
+                if hasattr(self.telemetry, 'update_generation'):
                     error_output = {
                         "error": str(e),
                         "failed_to_parse": response_text[:500]
                     }
-                    self.tracer.update_generation(output=error_output, usage=usage)
-                    logger.debug(f"[TOOL-ARGS] Updated generation with error: {str(e)}")
+                    self.telemetry.update_generation(output=error_output, usage=usage)
+                    self.logger.debug(f"[TOOL-ARGS] Updated generation with error: {str(e)}")
 
                 args = None
 
@@ -848,7 +855,7 @@ Please provide a comprehensive answer to the original question based on these fi
             {"role": "user", "content": f"Context: {context}\n\nTask: {task_description}\n\nYour response:"}
         ]
 
-        logger.debug(f"[ASYNC-RESPONSE] Generating response for: {task_description}")
+        self.logger.debug(f"[ASYNC-RESPONSE] Generating response for: {task_description}")
 
         response = await self.llm.chat.completions.create(
             model=self.model,
@@ -860,7 +867,7 @@ Please provide a comprehensive answer to the original question based on these fi
         self._update_token_usage(response)
 
         response_text = response.choices[0].message.content
-        logger.debug(f"[ASYNC-RESPONSE] Generated: {response_text}")
+        self.logger.debug(f"[ASYNC-RESPONSE] Generated: {response_text}")
         return response_text
 
     async def _check_completion(self, original_request: str, execution_history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -873,6 +880,19 @@ Please provide a comprehensive answer to the original question based on these fi
         Returns:
             Dictionary with completion status and reasoning
         """
+        # Check for repetitive tool calls - force completion if same tool called 3+ times
+        if len(execution_history) >= 3:
+            recent_tools = [item.get('tool') for item in execution_history[-3:]]
+            # If all 3 recent calls used the same tool, force completion
+            if len(set(recent_tools)) == 1 and recent_tools[0] is not None:
+                self.logger.warning(f"[ASYNC-COMPLETION] Detected repetitive tool calls ({recent_tools[0]}), forcing completion")
+                return {
+                    "is_complete": True,
+                    "reasoning": "Forced completion due to repetitive tool usage. Using available results.",
+                    "next_action": "none",
+                    "missing_steps": []
+                }
+
         history_summary = "\n".join([
             f"- {item['task']}: {item['result'][:200]}"
             for item in execution_history
@@ -888,7 +908,7 @@ Please provide a comprehensive answer to the original question based on these fi
             {"role": "user", "content": f"Original request: {original_request}\n\nExecution history:\n{history_summary}\n\nIs the task complete?"}
         ]
 
-        logger.debug(f"[ASYNC-COMPLETION] Checking completion for: {original_request}")
+        self.logger.debug(f"[ASYNC-COMPLETION] Checking completion for: {original_request}")
 
         response = await self.llm.chat.completions.create(
             model=self.model,
@@ -909,10 +929,10 @@ Please provide a comprehensive answer to the original question based on these fi
             else:
                 completion_status = json.loads(response_text)
 
-            logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
+            self.logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
             return completion_status
         except (json.JSONDecodeError, KeyError) as e:
-            logger.exception(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
+            self.logger.exception(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
             # Default to continuing if we can't parse
             return {
                 "is_complete": False,

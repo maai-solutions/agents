@@ -14,6 +14,9 @@ from .base import Agent
 # ReasoningAgent implementation
 from .reasoning_agent import ReasoningAgent
 
+# CoordinatorAgent implementation
+from .coordinator_agent import CoordinatorAgent, SubAgent
+
 # Factory functions
 from .factory import Agent
 
@@ -53,6 +56,8 @@ __all__ = [
     # Classes
     "Agent",
     "ReasoningAgent",
+    "CoordinatorAgent",
+    "SubAgent",
     # Factory
     "Agent",
     # Tool base classes

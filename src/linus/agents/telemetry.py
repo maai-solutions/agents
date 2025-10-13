@@ -178,27 +178,31 @@ def setup_telemetry(config: TelemetryConfig) -> Optional[Any]:
 class LangfuseTracer:
     """Tracer wrapper for Langfuse observability."""
 
-    def __init__(self, langfuse_client: Optional[Any] = None, session_id: Optional[str] = None):
+    def __init__(self, langfuse_client: Optional[Any] = None, session_id: Optional[str] = None, agent_name: Optional[str] = None):
         """Initialize Langfuse tracer.
 
         Args:
             langfuse_client: Langfuse client instance
             session_id: Session ID for grouping related traces
+            agent_name: Optional name for the agent (used in hierarchical naming)
         """
         self.client = langfuse_client
         self.enabled = langfuse_client is not None and LANGFUSE_AVAILABLE
         self.session_id = session_id
+        self.agent_name = agent_name or "default"
 
     def trace_agent_run(
         self,
         user_input: str,
-        agent_type: str = "ReasoningAgent"
+        agent_type: str = "ReasoningAgent",
+        agent_name: Optional[str] = None
     ) -> Any:
         """Create a trace for agent execution.
 
         Args:
             user_input: User's input query
             agent_type: Type of agent
+            agent_name: Optional agent name for hierarchical naming
 
         Returns:
             Trace context (AsyncContextManager for async compatibility)
@@ -207,12 +211,16 @@ class LangfuseTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Use provided agent_name or fall back to instance agent_name
+        name = agent_name or self.agent_name
+        trace_name = f"agent.{name}"
+
         # Create metadata including session_id if available
-        metadata = {"agent_type": agent_type}
+        metadata = {"agent_type": agent_type, "agent_name": name}
         if self.session_id:
             metadata["session_id"] = self.session_id
 
-        logger.info(f"[LANGFUSE] Creating trace span: agent_run with input: {user_input[:50]}...")
+        logger.info(f"[LANGFUSE] Creating trace span: {trace_name} with input: {user_input[:50]}...")
         logger.info(f"[LANGFUSE] Client type: {type(self.client)}, enabled: {self.enabled}")
         logger.info(f"[LANGFUSE] Metadata: {metadata}")
 
@@ -225,7 +233,7 @@ class LangfuseTracer:
                 """Wrap Langfuse context manager for async usage."""
                 # Use start_as_current_span to create a trace-level span
                 with self.client.start_as_current_span(
-                    name="agent_run",
+                    name=trace_name,
                     input={"query": user_input},
                     metadata=metadata
                 ) as span:
@@ -287,7 +295,8 @@ class LangfuseTracer:
         self,
         prompt: str,
         model: str,
-        call_type: str = "completion"
+        call_type: str = "completion",
+        llm_name: Optional[str] = None
     ) -> Any:
         """Create a span for LLM call.
 
@@ -295,6 +304,7 @@ class LangfuseTracer:
             prompt: Prompt sent to LLM
             model: Model name
             call_type: Type of call (reasoning, tool_args, generate)
+            llm_name: Optional LLM name for hierarchical naming (e.g., "reasoning", "tool_args")
 
         Returns:
             Generation context (AsyncContextManager for async compatibility)
@@ -303,8 +313,12 @@ class LangfuseTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Create hierarchical name: llm.<name>
+        name = llm_name or call_type
+        generation_name = f"llm.{name}"
+
         # Use Langfuse's generation API
-        logger.debug(f"[LANGFUSE] Creating generation span: llm_{call_type}")
+        logger.debug(f"[LANGFUSE] Creating generation span: {generation_name}")
 
         # Create generation using Langfuse context manager
         from contextlib import asynccontextmanager
@@ -315,10 +329,10 @@ class LangfuseTracer:
             try:
                 with self.client.start_as_current_observation(
                     as_type='generation',
-                    name=f"llm_{call_type}",
+                    name=generation_name,
                     model=model,
                     input=prompt,
-                    metadata={"call_type": call_type}
+                    metadata={"call_type": call_type, "llm_name": name}
                 ) as generation:
                     logger.debug(f"[LANGFUSE] Generation created: {type(generation)}")
                     yield generation
@@ -331,13 +345,15 @@ class LangfuseTracer:
     def trace_tool_execution(
         self,
         tool_name: str,
-        tool_args: Dict[str, Any]
+        tool_args: Dict[str, Any],
+        tool_display_name: Optional[str] = None
     ) -> Any:
         """Create a span for tool execution.
 
         Args:
             tool_name: Name of the tool
             tool_args: Arguments passed to tool
+            tool_display_name: Optional display name for hierarchical naming
 
         Returns:
             Span context (AsyncContextManager for async compatibility)
@@ -346,8 +362,12 @@ class LangfuseTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Create hierarchical name: tool.<name>
+        name = tool_display_name or tool_name
+        span_name = f"tool.{name}"
+
         # Use Langfuse's span API
-        logger.debug(f"[LANGFUSE] Creating tool execution span: tool_{tool_name}")
+        logger.debug(f"[LANGFUSE] Creating tool execution span: {span_name}")
 
         # Create span using Langfuse context manager
         from contextlib import asynccontextmanager
@@ -357,14 +377,58 @@ class LangfuseTracer:
             """Create tool execution span within current trace."""
             try:
                 with self.client.start_as_current_span(
-                    name=f"tool_{tool_name}",
+                    name=span_name,
                     input=tool_args,
-                    metadata={"tool": tool_name}
+                    metadata={"tool": tool_name, "tool_display_name": name}
                 ) as span:
                     logger.debug(f"[LANGFUSE] Tool span created: {type(span)}")
                     yield span
             except Exception as e:
                 logger.warning(f"[LANGFUSE] Error creating tool span: {e}")
+                yield None
+
+        return async_span_wrapper()
+
+    def trace_subagent_execution(
+        self,
+        subagent_name: str,
+        input_data: str
+    ) -> Any:
+        """Create a span for subagent execution (for hierarchical agent tracing).
+
+        Args:
+            subagent_name: Name of the subagent
+            input_data: Input data provided to the subagent
+
+        Returns:
+            Span context (AsyncContextManager for async compatibility)
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Create hierarchical name: agent.<subagent_name>
+        span_name = f"agent.{subagent_name}"
+
+        # Use Langfuse's span API
+        logger.debug(f"[LANGFUSE] Creating subagent execution span: {span_name}")
+
+        # Create span using Langfuse context manager
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Create subagent execution span within current trace."""
+            try:
+                with self.client.start_as_current_span(
+                    name=span_name,
+                    input={"query": input_data},
+                    metadata={"subagent": subagent_name}
+                ) as span:
+                    logger.debug(f"[LANGFUSE] Subagent span created: {type(span)}")
+                    yield span
+            except Exception as e:
+                logger.warning(f"[LANGFUSE] Error creating subagent span: {e}")
                 yield None
 
         return async_span_wrapper()
@@ -538,25 +602,29 @@ class LangfuseTracer:
 class AgentTracer:
     """Tracer wrapper for agent operations."""
 
-    def __init__(self, tracer: Optional[Any] = None):
+    def __init__(self, tracer: Optional[Any] = None, agent_name: Optional[str] = None):
         """Initialize agent tracer.
 
         Args:
             tracer: OpenTelemetry tracer instance
+            agent_name: Optional name for the agent (used in hierarchical naming)
         """
         self.tracer = tracer
         self.enabled = tracer is not None and OTEL_AVAILABLE
+        self.agent_name = agent_name or "default"
 
     def trace_agent_run(
         self,
         user_input: str,
-        agent_type: str = "ReasoningAgent"
+        agent_type: str = "ReasoningAgent",
+        agent_name: Optional[str] = None
     ) -> Any:
         """Create a span for agent execution.
 
         Args:
             user_input: User's input query
             agent_type: Type of agent
+            agent_name: Optional agent name for hierarchical naming
 
         Returns:
             Span context manager (AsyncContextManager for async compatibility)
@@ -565,6 +633,10 @@ class AgentTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Use provided agent_name or fall back to instance agent_name
+        name = agent_name or self.agent_name
+        span_name = f"agent.{name}"
+
         # Wrap OpenTelemetry's sync context manager for async usage
         from contextlib import asynccontextmanager
 
@@ -572,10 +644,11 @@ class AgentTracer:
         async def async_span_wrapper():
             """Wrap sync OpenTelemetry context manager for async usage."""
             with self.tracer.start_as_current_span(
-                "agent.run",
+                span_name,
                 kind=SpanKind.SERVER,
                 attributes={
                     "agent.type": agent_type,
+                    "agent.name": name,
                     "agent.input": user_input,  # No truncation
                 }
             ) as span:
@@ -622,7 +695,8 @@ class AgentTracer:
         self,
         prompt: str,
         model: str,
-        call_type: str = "completion"
+        call_type: str = "completion",
+        llm_name: Optional[str] = None
     ) -> Any:
         """Create a span for LLM call.
 
@@ -630,6 +704,7 @@ class AgentTracer:
             prompt: Prompt sent to LLM
             model: Model name
             call_type: Type of call (reasoning, tool_args, generate)
+            llm_name: Optional LLM name for hierarchical naming (e.g., "reasoning", "tool_args")
 
         Returns:
             Span context manager (AsyncContextManager for async compatibility)
@@ -638,6 +713,10 @@ class AgentTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Create hierarchical name: llm.<name>
+        name = llm_name or call_type
+        span_name = f"llm.{name}"
+
         # Wrap OpenTelemetry's sync context manager for async usage
         from contextlib import asynccontextmanager
 
@@ -645,9 +724,10 @@ class AgentTracer:
         async def async_span_wrapper():
             """Wrap sync OpenTelemetry context manager for async usage."""
             with self.tracer.start_as_current_span(
-                f"llm.{call_type}",
+                span_name,
                 attributes={
                     "llm.model": model,
+                    "llm.name": name,
                     "llm.prompt": prompt,  # No truncation
                     "llm.call_type": call_type,
                 }
@@ -659,13 +739,15 @@ class AgentTracer:
     def trace_tool_execution(
         self,
         tool_name: str,
-        tool_args: Dict[str, Any]
+        tool_args: Dict[str, Any],
+        tool_display_name: Optional[str] = None
     ) -> Any:
         """Create a span for tool execution.
 
         Args:
             tool_name: Name of the tool
             tool_args: Arguments passed to tool
+            tool_display_name: Optional display name for hierarchical naming
 
         Returns:
             Span context manager (AsyncContextManager for async compatibility)
@@ -674,6 +756,10 @@ class AgentTracer:
             from contextlib import nullcontext
             return nullcontext()
 
+        # Create hierarchical name: tool.<name>
+        name = tool_display_name or tool_name
+        span_name = f"tool.{name}"
+
         # Wrap OpenTelemetry's sync context manager for async usage
         from contextlib import asynccontextmanager
 
@@ -681,10 +767,49 @@ class AgentTracer:
         async def async_span_wrapper():
             """Wrap sync OpenTelemetry context manager for async usage."""
             with self.tracer.start_as_current_span(
-                f"tool.{tool_name}",
+                span_name,
                 attributes={
                     "tool.name": tool_name,
+                    "tool.display_name": name,
                     "tool.args": str(tool_args),  # No truncation
+                }
+            ) as span:
+                yield span
+
+        return async_span_wrapper()
+
+    def trace_subagent_execution(
+        self,
+        subagent_name: str,
+        input_data: str
+    ) -> Any:
+        """Create a span for subagent execution (for hierarchical agent tracing).
+
+        Args:
+            subagent_name: Name of the subagent
+            input_data: Input data provided to the subagent
+
+        Returns:
+            Span context manager (AsyncContextManager for async compatibility)
+        """
+        if not self.enabled:
+            from contextlib import nullcontext
+            return nullcontext()
+
+        # Create hierarchical name: agent.<subagent_name>
+        span_name = f"agent.{subagent_name}"
+
+        # Wrap OpenTelemetry's sync context manager for async usage
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_span_wrapper():
+            """Wrap sync OpenTelemetry context manager for async usage."""
+            with self.tracer.start_as_current_span(
+                span_name,
+                attributes={
+                    "agent.subagent": subagent_name,
+                    "agent.input": input_data,  # No truncation
                 }
             ) as span:
                 yield span
@@ -794,6 +919,7 @@ def initialize_telemetry(
     langfuse_secret_key: Optional[str] = None,
     langfuse_host: Optional[str] = None,
     session_id: Optional[str] = None,
+    agent_name: Optional[str] = None,
     enabled: bool = True
 ):
     """Initialize global telemetry.
@@ -807,6 +933,7 @@ def initialize_telemetry(
         langfuse_secret_key: Langfuse secret API key
         langfuse_host: Langfuse host URL
         session_id: Session ID for grouping related traces (Langfuse only)
+        agent_name: Optional name for the agent (used in hierarchical naming)
         enabled: Whether to enable tracing
 
     Returns:
@@ -829,9 +956,9 @@ def initialize_telemetry(
 
     # Return appropriate tracer based on exporter type
     if config.exporter_type == "langfuse":
-        _global_tracer = LangfuseTracer(tracer_backend, session_id=session_id)
+        _global_tracer = LangfuseTracer(tracer_backend, session_id=session_id, agent_name=agent_name)
     else:
-        _global_tracer = AgentTracer(tracer_backend)
+        _global_tracer = AgentTracer(tracer_backend, agent_name=agent_name)
 
     return _global_tracer
 

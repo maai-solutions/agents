@@ -1,6 +1,6 @@
-"""FastAPI application to test the ReasoningAgent with Gemma3:27b."""
+"""FastAPI application with CoordinatorAgent orchestrating specialized subagents."""
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -18,14 +18,13 @@ from pathlib import Path
 
 from linus.agents.agent.mcp_client import MCPServerConfig, connect_mcp_servers
 from linus.agents.tools.entities_search import EntitiesSearchTool
-from linus.agents.tools.vector_store import VectorStoreTool
 
 # Load .env from src directory (where this file is located)
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from linus.agents.agent import ReasoningAgent, Agent, get_default_tools, create_custom_tool
-from linus.agents.telemetry import initialize_telemetry, get_tracer
+from linus.agents.agent import Agent, CoordinatorAgent, SubAgent
+from linus.agents.telemetry import initialize_telemetry
 from linus.settings import Settings
 
 
@@ -70,7 +69,8 @@ if settings.log_file:
     )
 
 # Global agent instance
-agent: Optional[ReasoningAgent] = None
+coordinator: Optional[CoordinatorAgent] = None
+mcp_manager = None
 
 # Store conversation history
 conversation_history: List[Dict[str, Any]] = []
@@ -78,11 +78,12 @@ conversation_history: List[Dict[str, Any]] = []
 
 class AgentRequest(BaseModel):
     """Request model for agent interactions."""
-    
+
     query: str = Field(..., description="The user's query or task for the agent")
     use_tools: bool = Field(default=True, description="Whether to use tools")
     stream: bool = Field(default=False, description="Whether to stream the response")
     session_id: Optional[str] = Field(default=None, description="Session ID for context")
+    max_iterations: Optional[int] = Field(default=10, description="Maximum iterations for agent execution")
 
 
 class AgentResponse(BaseModel):
@@ -91,7 +92,7 @@ class AgentResponse(BaseModel):
     query: str
     response: str
     reasoning: Optional[Dict[str, Any]] = None
-    tools_used: List[str] = []
+    subagents_used: List[str] = []
     execution_time: float
     timestamp: str
     session_id: Optional[str] = None
@@ -99,42 +100,33 @@ class AgentResponse(BaseModel):
     model_params: Optional[Dict[str, Any]] = None
 
 
-class ToolTestRequest(BaseModel):
-    """Request model for testing individual tools."""
-    
-    tool_name: str = Field(..., description="Name of the tool to test")
-    tool_args: Dict[str, Any] = Field(..., description="Arguments for the tool")
-
-
 class HealthResponse(BaseModel):
     """Health check response."""
-    
+
     status: str
     agent_ready: bool
     model: str
-    available_tools: List[str]
+    available_subagents: List[str]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
-    global agent
-    mcp_manager = None  # Store MCP manager for cleanup
+    global coordinator, mcp_manager
 
     # Startup
-    logger.info("Starting ReasoningAgent API...")
+    logger.info("Starting CoordinatorAgent API...")
 
     # Initialize telemetry if enabled
     tracer = None
     if settings.telemetry_enabled:
         logger.info(f"[TELEMETRY] Initializing {settings.telemetry_exporter} tracing...")
 
-        # Use Langfuse keys if available, otherwise fall back to generic telemetry keys
         langfuse_public = settings.langfuse_public_key or settings.telemetry_public_key or None
         langfuse_secret = settings.langfuse_secret_key or settings.telemetry_secret_key or None
 
         tracer = initialize_telemetry(
-            service_name="reasoning-agent-api",
+            service_name="coordinator-agent-api",
             exporter_type=settings.telemetry_exporter,
             otlp_endpoint=settings.telemetry_otlp_endpoint,
             jaeger_endpoint=settings.telemetry_jaeger_endpoint,
@@ -148,64 +140,65 @@ async def lifespan(app: FastAPI):
         logger.info("[TELEMETRY] Telemetry disabled")
 
     try:
-        # Initialize the agent
-        tools = [] #get_default_tools()  # Start with default tools
-
-        # Add some custom tools for testing
-        def get_time() -> str:
-            """Get the current time."""
-            return f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-        time_tool = create_custom_tool(
-            name="get_time",
-            description="Get the current date and time",
-            func=get_time
-        )
-        tools.append(time_tool)
-
-        # vector_store_tool = VectorStoreTool()
-        # tools.append(vector_store_tool)
-        
-        entities_search_tool = EntitiesSearchTool()
-        tools.append(entities_search_tool)
-        
+        # Configure MCP servers
         servers = {
-        "filesystem": MCPServerConfig(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-        ),
-        "time": MCPServerConfig(
-            command="docker",
-            args=["run", "-i", "--rm", "mcp/time"]
-        ),
-         "sequentialthinking": MCPServerConfig(
-            command="docker",
-            args=["run", "-i", "--rm", "mcp/sequentialthinking"]
-        ),
-         "memory": MCPServerConfig(
-            command="docker",
-            args=["run", "-i", "--rm", "-v", "/Users/udg/Projects/Git/agents/memory:/memory", "mcp/memory"]
-        ),
-         "vector-store": MCPServerConfig(
-            command="python",
-            args=["-m", "linus.mcp.vector_store"],
-            cwd="/Users/udg/Projects/Git/agents/src",
-            env={
-                "WV_HTTP_HOST": "localhost",
-                "WV_HTTP_PORT": "18080",
-                "WV_GRPC_HOST": "localhost",
-                "WV_GRPC_PORT": "50051",
-                "LLM_API_BASE": "http://localhost:11434/v1"
-            }
-        )
-    }
+            "filesystem": MCPServerConfig(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+            ),
+            "time": MCPServerConfig(
+                command="docker",
+                args=["run", "-i", "--rm", "mcp/time"]
+            ),
+            "sequentialthinking": MCPServerConfig(
+                command="docker",
+                args=["run", "-i", "--rm", "mcp/sequentialthinking"]
+            ),
+            "memory": MCPServerConfig(
+                command="docker",
+                args=["run", "-i", "--rm", "-v", "/Users/udg/Projects/ai/agents/memory:/memory", "mcp/memory"]
+            ),
+            "vector-store": MCPServerConfig(
+                command="python",
+                args=["-m", "linus.mcp.vector_store"],
+                cwd="/Users/udg/Projects/ai/agents/src",
+                env={
+                    "WV_HTTP_HOST": "localhost",
+                    "WV_HTTP_PORT": "18080",
+                    "WV_GRPC_HOST": "localhost",
+                    "WV_GRPC_PORT": "50051",
+                    "LLM_API_BASE": "http://localhost:11434/v1"
+                }
+            )
+        }
 
-        # Connect and get tools
+        # Connect to MCP servers and get tools
+        logger.info("[MCP] Connecting to MCP servers...")
         mcp_manager, mcp_tools = await connect_mcp_servers(servers)
+        logger.info(f"[MCP] Connected. Total MCP tools: {len(mcp_tools)}")
 
-        tools = tools + mcp_tools
+        # Create tool mapping by server
+        mcp_tools_by_server = {}
+        for tool in mcp_tools:
+            # Tool names are prefixed with server name (e.g., "filesystem_read_file")
+            server_name = tool.name.split('_')[0]
+            if server_name not in mcp_tools_by_server:
+                mcp_tools_by_server[server_name] = []
+            mcp_tools_by_server[server_name].append(tool)
 
-        agent = Agent(
+        # Add EntitiesSearchTool
+        entities_search_tool = EntitiesSearchTool()
+
+        # Create Researcher subagent
+        logger.info("[SUBAGENT] Creating Researcher agent...")
+        researcher_tools = [entities_search_tool]
+        # Add vector-store MCP tools
+        if 'vector' in mcp_tools_by_server or 'vector-store' in mcp_tools_by_server:
+            vector_tools = mcp_tools_by_server.get('vector-store', []) or mcp_tools_by_server.get('vector', [])
+            researcher_tools.extend(vector_tools)
+            logger.info(f"[SUBAGENT] Added {len(vector_tools)} vector-store tools to Researcher")
+
+        researcher_agent = Agent(
             api_base=settings.llm_api_base,
             model=settings.llm_model,
             api_key=settings.llm_api_key,
@@ -213,23 +206,131 @@ async def lifespan(app: FastAPI):
             max_tokens=settings.llm_max_tokens,
             top_p=settings.llm_top_p,
             top_k=settings.llm_top_k,
-            tools=tools,
+            tools=researcher_tools,
             verbose=settings.agent_verbose,
             tracer=tracer,
-            use_async=True  # Use AsyncOpenAI for MCP tool support
+            use_async=True,
+            agent_name="Researcher"
         )
-        
-        logger.info(f"Agent initialized with {len(tools)} tools")
+        logger.info(f"[SUBAGENT] Researcher created with {len(researcher_tools)} tools")
+
+        # Create Jacksmith subagent (filesystem and time)
+        logger.info("[SUBAGENT] Creating Jacksmith agent...")
+        jacksmith_tools = []
+        # Add filesystem tools
+        if 'filesystem' in mcp_tools_by_server:
+            jacksmith_tools.extend(mcp_tools_by_server['filesystem'])
+        # Add time tools
+        if 'time' in mcp_tools_by_server:
+            jacksmith_tools.extend(mcp_tools_by_server['time'])
+
+        jacksmith_agent = Agent(
+            api_base=settings.llm_api_base,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            top_p=settings.llm_top_p,
+            top_k=settings.llm_top_k,
+            tools=jacksmith_tools,
+            verbose=settings.agent_verbose,
+            tracer=tracer,
+            use_async=True,
+            agent_name="Jacksmith"
+        )
+        logger.info(f"[SUBAGENT] Jacksmith created with {len(jacksmith_tools)} tools")
+
+        # Create Reasoner subagent (sequential thinking and memory)
+        logger.info("[SUBAGENT] Creating Reasoner agent...")
+        reasoner_tools = []
+        # Add sequential thinking tools
+        if 'sequentialthinking' in mcp_tools_by_server:
+            reasoner_tools.extend(mcp_tools_by_server['sequentialthinking'])
+        # Add memory tools
+        if 'memory' in mcp_tools_by_server:
+            reasoner_tools.extend(mcp_tools_by_server['memory'])
+
+        reasoner_agent = Agent(
+            api_base=settings.llm_api_base,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            top_p=settings.llm_top_p,
+            top_k=settings.llm_top_k,
+            tools=reasoner_tools,
+            verbose=settings.agent_verbose,
+            tracer=tracer,
+            use_async=True,
+            agent_name="Reasoner"
+        )
+        logger.info(f"[SUBAGENT] Reasoner created with {len(reasoner_tools)} tools")
+
+        # Create SubAgent wrappers
+        subagents = [
+            SubAgent(
+                agent=researcher_agent,
+                name="Researcher",
+                description="Specializes in information retrieval, search, and data gathering using vector databases and entity search",
+                capabilities=[
+                    "Search for entities and related information",
+                    "Query vector databases for semantic search",
+                    "Retrieve relevant documents and content"
+                ]
+            ),
+            SubAgent(
+                agent=jacksmith_agent,
+                name="Jacksmith",
+                description="Handles file system operations, time-related queries, and document management",
+                capabilities=[
+                    "Read and write files",
+                    "List directory contents",
+                    "Get current time and date information",
+                    "Manage temporary files"
+                ]
+            ),
+            SubAgent(
+                agent=reasoner_agent,
+                name="Reasoner",
+                description="Performs deep reasoning, maintains memory, and handles complex analytical tasks",
+                capabilities=[
+                    "Sequential step-by-step reasoning",
+                    "Store and retrieve knowledge from memory",
+                    "Analyze complex problems",
+                    "Connect related concepts"
+                ]
+            )
+        ]
+
+        # Create CoordinatorAgent
+        logger.info("[COORDINATOR] Creating CoordinatorAgent...")
+        coordinator = CoordinatorAgent(
+            llm=researcher_agent.llm,  # Use same LLM client
+            model=settings.llm_model,
+            subagents=subagents,
+            verbose=settings.agent_verbose,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            top_p=settings.llm_top_p,
+            top_k=settings.llm_top_k,
+            api_base=settings.llm_api_base,
+            max_iterations=15,
+            logger=None,  # Use DI container
+            telemetry=tracer,
+            agent_name="Coordinator"
+        )
+
+        logger.info(f"[COORDINATOR] Initialized with {len(subagents)} subagents")
         logger.info(f"Using model: {settings.llm_model} at {settings.llm_api_base}")
-        
+
     except Exception as e:
-        logger.exception(f"Failed to initialize agent: {e}")
+        logger.exception(f"Failed to initialize coordinator: {e}")
         raise
-    
+
     yield
 
     # Shutdown
-    logger.info("Shutting down ReasoningAgent API...")
+    logger.info("Shutting down CoordinatorAgent API...")
 
     # Cleanup MCP connections
     if mcp_manager:
@@ -256,57 +357,58 @@ async def root():
     return {
         "name": settings.app_name,
         "version": settings.app_version,
-        "status": "running"
+        "status": "running",
+        "architecture": "coordinator"
     }
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Check the health status of the application."""
-    global agent
-    
-    available_tools = []
-    if agent:
-        available_tools = [tool.name for tool in agent.tools]
-    
+    global coordinator
+
+    available_subagents = []
+    if coordinator:
+        available_subagents = [sa.name for sa in coordinator.subagents]
+
     return HealthResponse(
-        status="healthy" if agent else "unhealthy",
-        agent_ready=agent is not None,
+        status="healthy" if coordinator else "unhealthy",
+        agent_ready=coordinator is not None,
         model=settings.llm_model,
-        available_tools=available_tools
+        available_subagents=available_subagents
     )
 
 
 @app.post("/agent/query", response_model=AgentResponse)
-async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
-    """Send a query to the agent and get a response."""
-    global agent, conversation_history
-    
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+async def query_agent(request: AgentRequest):
+    """Send a query to the coordinator agent and get a response."""
+    global coordinator, conversation_history
+
+    if not coordinator:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
     start_time = datetime.now()
-    
+
     try:
-        # Run the agent (async-only)
-        agent_response = await agent.run(request.query)
+        # Run the coordinator agent
+        agent_response = await coordinator.run(request.query)
 
         execution_time = (datetime.now() - start_time).total_seconds()
 
-        # Handle AgentResponse from agent.run (returns AgentResponse by default with return_metrics=True)
+        # Handle AgentResponse from coordinator
         from linus.agents.agent import AgentResponse as AgentResponseData
 
         if isinstance(agent_response, AgentResponseData):
             # Extract the result string from AgentResponse
             result_text = str(agent_response.result)
 
-            # Extract tools used from execution history
-            tools_used = []
+            # Extract subagents used from execution history
+            subagents_used = []
             if agent_response.execution_history:
-                tools_used = [
-                    item.get("tool")
+                subagents_used = [
+                    item.get("subagent")
                     for item in agent_response.execution_history
-                    if item.get("tool")
+                    if item.get("subagent")
                 ]
 
             # Build reasoning info from execution history
@@ -314,7 +416,7 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
             if agent_response.execution_history:
                 reasoning = {
                     "completion_status": agent_response.completion_status,
-                    "iterations": agent_response.metrics.total_iterations,
+                    "iterations": agent_response.metrics.total_iterations if agent_response.metrics else 0,
                     "execution_history": agent_response.execution_history
                 }
 
@@ -323,41 +425,41 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         else:
             # Fallback for string response
             result_text = str(agent_response)
-            tools_used = []
+            subagents_used = []
             reasoning = None
             metrics = None
 
-        # Extract model parameters from agent
+        # Extract model parameters
         model_params = {
-            "base_url": agent.api_base,
-            "model": agent.model,
-            "temperature": agent.temperature,
-            "max_tokens": agent.max_tokens,
-            "top_p": agent.top_p,
-            "top_k": agent.top_k
+            "base_url": coordinator.api_base,
+            "model": coordinator.model,
+            "temperature": coordinator.temperature,
+            "max_tokens": coordinator.max_tokens,
+            "top_p": coordinator.top_p,
+            "top_k": coordinator.top_k
         }
 
         response = AgentResponse(
             query=request.query,
             response=result_text,
             reasoning=reasoning,
-            tools_used=list(set(tools_used)),  # Remove duplicates
+            subagents_used=list(set(subagents_used)),  # Remove duplicates
             execution_time=execution_time,
             timestamp=datetime.now().isoformat(),
             session_id=request.session_id,
             metrics=metrics,
             model_params=model_params
         )
-        
+
         # Store in conversation history
         conversation_history.append(response.model_dump())
-        
+
         # Limit history size
         if len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
-        
+
         return response
-        
+
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=408,
@@ -368,104 +470,42 @@ async def query_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agent/reasoning")
-async def test_reasoning(request: AgentRequest):
-    """Test only the reasoning phase without execution."""
-    global agent
-    
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    try:
-        # Run reasoning phase only
-        loop = asyncio.get_event_loop()
-        reasoning_result = await loop.run_in_executor(
-            None, 
-            agent._reasoning_call, 
-            request.query
-        )
-        
-        return {
-            "query": request.query,
-            "has_sufficient_info": reasoning_result.has_sufficient_info,
-            "reasoning": reasoning_result.reasoning,
-            "planned_tasks": reasoning_result.tasks
+@app.get("/subagents")
+async def list_subagents():
+    """List all available subagents and their capabilities."""
+    global coordinator
+
+    if not coordinator:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
+    subagents_info = []
+    for subagent in coordinator.subagents:
+        # Get tool names from the subagent's agent
+        tool_names = [tool.name for tool in subagent.agent.tools]
+
+        subagent_info = {
+            "name": subagent.name,
+            "description": subagent.description,
+            "capabilities": subagent.capabilities,
+            "tools": tool_names,
+            "tool_count": len(tool_names)
         }
-        
-    except Exception as e:
-        logger.exception(f"Error in reasoning phase: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        subagents_info.append(subagent_info)
 
-
-@app.post("/tools/test")
-async def test_tool(request: ToolTestRequest):
-    """Test a specific tool with given arguments."""
-    global agent
-    
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    if request.tool_name not in agent.tool_map:
-        available = list(agent.tool_map.keys())
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tool '{request.tool_name}' not found. Available tools: {available}"
-        )
-    
-    try:
-        tool = agent.tool_map[request.tool_name]
-        
-        # Execute the tool
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            tool.run,
-            request.tool_args
-        )
-        
-        return {
-            "tool": request.tool_name,
-            "args": request.tool_args,
-            "result": result
-        }
-        
-    except Exception as e:
-        logger.exception(f"Error executing tool {request.tool_name}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/tools")
-async def list_tools():
-    """List all available tools."""
-    global agent
-    
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    tools_info = []
-    for tool in agent.tools:
-        tool_info = {
-            "name": tool.name,
-            "description": tool.description
-        }
-        
-        # Add schema if available
-        if hasattr(tool, 'args_schema') and tool.args_schema:
-            tool_info["schema"] = tool.args_schema.schema()
-        
-        tools_info.append(tool_info)
-    
-    return {"tools": tools_info}
+    return {
+        "subagents": subagents_info,
+        "total_subagents": len(subagents_info)
+    }
 
 
 @app.get("/history")
 async def get_history(limit: int = 10, session_id: Optional[str] = None):
     """Get conversation history."""
     history = conversation_history
-    
+
     if session_id:
         history = [h for h in history if h.get("session_id") == session_id]
-    
+
     # Return most recent items
     return {"history": history[-limit:], "total": len(history)}
 
@@ -482,18 +522,17 @@ async def clear_history():
 @app.post("/agent/batch")
 async def batch_queries(queries: List[str]):
     """Process multiple queries in batch."""
-    global agent
+    global coordinator
 
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
+    if not coordinator:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
 
     from linus.agents.agent import AgentResponse as AgentResponseData
     results = []
 
     for query in queries:
         try:
-            loop = asyncio.get_event_loop()
-            agent_response = await loop.run_in_executor(None, agent.run, query)
+            agent_response = await coordinator.run(query)
 
             # Extract string result from AgentResponse
             if isinstance(agent_response, AgentResponseData):
@@ -514,49 +553,6 @@ async def batch_queries(queries: List[str]):
             })
 
     return {"results": results}
-
-
-# Example endpoint for testing specific scenarios
-@app.get("/test/scenarios")
-async def test_scenarios():
-    """Run predefined test scenarios."""
-    global agent
-
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-
-    from linus.agents.agent import AgentResponse as AgentResponseData
-
-    scenarios = [
-        "What is the current time?",
-        "Calculate 42 * 17 + 256",
-        "Search for information about FastAPI",
-        "First get the current time, then calculate 100/4, and finally search for Python"
-    ]
-
-    results = []
-    for scenario in scenarios:
-        try:
-            loop = asyncio.get_event_loop()
-            agent_response = await loop.run_in_executor(None, agent.run, scenario)
-
-            # Extract string result from AgentResponse
-            if isinstance(agent_response, AgentResponseData):
-                result_text = str(agent_response.result)
-            else:
-                result_text = str(agent_response)
-
-            results.append({
-                "scenario": scenario,
-                "result": result_text[:200] + "..." if len(result_text) > 200 else result_text
-            })
-        except Exception as e:
-            results.append({
-                "scenario": scenario,
-                "error": str(e)
-            })
-
-    return {"test_results": results}
 
 
 if __name__ == "__main__":

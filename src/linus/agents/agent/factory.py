@@ -1,11 +1,12 @@
 """Factory functions for creating agents."""
 
-from typing import List, Optional, Type, Any
+from typing import List, Optional, Type, Any, Union
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
 from loguru import logger
 
 from .reasoning_agent import ReasoningAgent
+from .coordinator_agent import CoordinatorAgent, SubAgent
 from .tool_base import BaseTool
 from ..graph.state import SharedState
 
@@ -42,7 +43,8 @@ def Agent(
     use_async: bool = False,
     use_json_format: bool = False,
     tracer: Optional[Any] = None,
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
+    agent_name: Optional[str] = None
 ) -> ReasoningAgent:
     """Create a ReasoningAgent configured for Gemma3:27b or other OpenAI-compatible models.
 
@@ -70,6 +72,7 @@ def Agent(
         use_json_format: Whether to use response_format={"type": "json_object"} (default: False, not all models support this)
         tracer: Optional telemetry tracer (AgentTracer or LangfuseTracer)
         session_id: Optional session ID for Langfuse session grouping
+        agent_name: Optional name for the agent (used in hierarchical tracing like agent.<name>)
 
     Returns:
         Configured ReasoningAgent instance
@@ -142,15 +145,175 @@ def Agent(
         top_p=top_p,
         top_k=top_k,
         api_base=api_base,
-        use_json_format=use_json_format
+        use_json_format=use_json_format,
+        agent_name=agent_name
     )
 
     # Override tracer if provided
     if tracer is not None:
-        agent.tracer = tracer
+        agent.telemetry = tracer
+        # Update tracer with agent_name if supported
+        if agent_name is not None and hasattr(tracer, 'agent_name'):
+            tracer.agent_name = agent_name
 
-    # If session_id is provided but no tracer, update the agent's tracer if it's a LangfuseTracer
-    if session_id is not None and hasattr(agent.tracer, 'session_id'):
-        agent.tracer.session_id = session_id
+    # If session_id is provided, update the agent's tracer if it's a LangfuseTracer
+    if session_id is not None and hasattr(agent.telemetry, 'session_id'):
+        agent.telemetry.session_id = session_id
 
     return agent
+
+
+def Coordinator(
+    api_base: str = "http://localhost:11434/v1",
+    model: str = "gemma3:27b",
+    api_key: str = "not-needed",
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    subagents: Optional[List[SubAgent]] = None,
+    tools: Optional[List[BaseTool]] = None,
+    verbose: bool = True,
+    input_schema: Optional[Type[BaseModel]] = None,
+    output_schema: Optional[Type[BaseModel]] = None,
+    output_key: Optional[str] = None,
+    state: Optional[SharedState] = None,
+    max_iterations: int = 15,
+    enable_memory: bool = False,
+    memory_backend: str = "in_memory",
+    max_context_tokens: int = 4096,
+    memory_context_ratio: float = 0.3,
+    max_memory_size: Optional[int] = 100,
+    use_async: bool = True,
+    use_json_format: bool = False,
+    tracer: Optional[Any] = None,
+    session_id: Optional[str] = None,
+    agent_name: Optional[str] = None
+) -> CoordinatorAgent:
+    """Create a CoordinatorAgent that orchestrates multiple subagents.
+
+    Args:
+        api_base: The OpenAI-compatible API endpoint
+        model: The model name (e.g., "gemma3:27b", "gpt-4")
+        api_key: API key for authentication
+        temperature: Sampling temperature (0.0 to 2.0)
+        max_tokens: Maximum tokens to generate
+        top_p: Nucleus sampling parameter
+        top_k: Top-k sampling parameter
+        subagents: List of SubAgent instances to coordinate
+        tools: Optional list of tools for the coordinator (not subagents)
+        verbose: Whether to enable verbose logging
+        input_schema: Optional Pydantic BaseModel for input validation
+        output_schema: Optional Pydantic BaseModel for output
+        output_key: Optional key to save output in shared state
+        state: Optional SharedState instance
+        max_iterations: Maximum number of plan-execute-evaluate loops (default: 15)
+        enable_memory: Whether to enable memory management
+        memory_backend: Type of memory backend
+        max_context_tokens: Maximum tokens for context window
+        memory_context_ratio: Ratio of context to use for memory
+        max_memory_size: Maximum number of memories to keep
+        use_async: Whether to use AsyncOpenAI client (default: True)
+        use_json_format: Whether to use JSON response format
+        tracer: Optional telemetry tracer
+        session_id: Optional session ID for Langfuse
+        agent_name: Optional name for the agent
+
+    Returns:
+        Configured CoordinatorAgent instance
+
+    Examples:
+        # Create specialized subagents
+        research_agent = Agent(model="gemma3:27b", tools=[SearchTool()])
+        calc_agent = Agent(model="gemma3:27b", tools=[CalculatorTool()])
+
+        # Wrap them as SubAgents
+        subagents = [
+            SubAgent(
+                agent=research_agent,
+                name="researcher",
+                description="Searches for information",
+                capabilities=["search", "web_research"]
+            ),
+            SubAgent(
+                agent=calc_agent,
+                name="calculator",
+                description="Performs calculations",
+                capabilities=["math", "calculator"]
+            )
+        ]
+
+        # Create coordinator
+        coordinator = Coordinator(
+            model="gemma3:27b",
+            subagents=subagents,
+            verbose=True
+        )
+    """
+    # Configure OpenAI client
+    if use_async:
+        llm = AsyncOpenAI(
+            base_url=api_base,
+            api_key=api_key
+        )
+    else:
+        llm = OpenAI(
+            base_url=api_base,
+            api_key=api_key
+        )
+
+    if subagents is None:
+        subagents = []
+        logger.warning("[COORDINATOR] No subagents provided to coordinator")
+
+    if tools is None:
+        tools = []
+
+    # Create memory manager if enabled
+    memory_manager = None
+    if enable_memory and MEMORY_AVAILABLE:
+        memory_manager = create_memory_manager(
+            backend_type=memory_backend,
+            max_context_tokens=max_context_tokens,
+            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            llm=llm,
+            model=model,
+            max_size=max_memory_size
+        )
+        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend")
+    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.warning("[MEMORY] Memory requested but module not available")
+
+    coordinator = CoordinatorAgent(
+        llm=llm,
+        model=model,
+        subagents=subagents,
+        tools=tools,
+        verbose=verbose,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        output_key=output_key,
+        state=state,
+        max_iterations=max_iterations,
+        memory_manager=memory_manager,
+        memory_context_ratio=memory_context_ratio,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        top_k=top_k,
+        api_base=api_base,
+        use_json_format=use_json_format,
+        agent_name=agent_name
+    )
+
+    # Override tracer if provided
+    if tracer is not None:
+        coordinator.telemetry = tracer
+        if agent_name is not None and hasattr(tracer, 'agent_name'):
+            tracer.agent_name = agent_name
+
+    # If session_id is provided, update the tracer
+    if session_id is not None and hasattr(coordinator.telemetry, 'session_id'):
+        coordinator.telemetry.session_id = session_id
+
+    return coordinator

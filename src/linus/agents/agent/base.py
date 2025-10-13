@@ -5,11 +5,13 @@ import json
 import re
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
-from loguru import logger
+
+from linus.agents.agent.memory import MemoryManager
 
 # Import SharedState from graph module
 from ..graph.state import SharedState
 from .tool_base import BaseTool
+from ..di import ILogger, ITelemetry, get_container
 
 
 class Agent:
@@ -25,7 +27,10 @@ class Agent:
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
         state: Optional[SharedState] = None,
-        memory_manager: Optional['MemoryManager'] = None
+        memory_manager: Optional[MemoryManager] = None,
+        logger: Optional[ILogger] = None,
+        telemetry: Optional[ITelemetry] = None,
+        agent_name: Optional[str] = None
     ):
         """Initialize the base agent.
 
@@ -39,6 +44,9 @@ class Agent:
             output_key: Optional key to save output in shared state
             state: Optional SharedState instance for state management
             memory_manager: Optional memory manager for context persistence
+            logger: Optional logger instance (uses DI container if None)
+            telemetry: Optional telemetry instance (uses DI container if None)
+            agent_name: Optional name for the agent (used in hierarchical tracing)
         """
         self.llm = llm
         self.model = model
@@ -48,11 +56,21 @@ class Agent:
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.output_key = output_key
+        self.agent_name = agent_name or "default"
 
         # Use SharedState directly
         self.state = state or SharedState()
 
         self.memory_manager = memory_manager
+
+        # Dependency injection for logger and telemetry
+        container = get_container()
+        self.logger = logger or container.get_logger()
+        self.telemetry = telemetry or container.get_telemetry()
+
+        # Update telemetry tracer with agent_name if it has the attribute
+        if hasattr(self.telemetry, 'agent_name'):
+            self.telemetry.agent_name = self.agent_name
 
     def run(self, input_data: Union[str, BaseModel, Dict[str, Any]]) -> Union[str, BaseModel]:
         """Run the agent on the given input.
@@ -138,7 +156,7 @@ class Agent:
     def _log(self, message: str):
         """Log a message if verbose mode is enabled."""
         if self.verbose:
-            logger.info(message)
+            self.logger.info(message)
 
     def _update_token_usage(self, response: Any):
         """Extract and update token usage from OpenAI response.
@@ -166,4 +184,4 @@ class Agent:
                 self.current_metrics.total_output_tokens += estimated_tokens
                 self.current_metrics.total_tokens += estimated_tokens
         except Exception as e:
-            logger.debug(f"Could not extract token usage: {e}")
+            self.logger.debug(f"Could not extract token usage: {e}")
