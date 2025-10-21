@@ -6,6 +6,27 @@ from pydantic import BaseModel
 
 
 @dataclass
+class Citation:
+    """Citation for a piece of information from a document."""
+    document_id: str
+    chunk_number: int
+    score: Optional[float] = None
+    content_preview: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert citation to dictionary."""
+        result = {
+            "document_id": self.document_id,
+            "chunk_number": self.chunk_number
+        }
+        if self.score is not None:
+            result["score"] = round(self.score, 4)
+        if self.content_preview:
+            result["content_preview"] = self.content_preview
+        return result
+
+
+@dataclass
 class ReasoningResult:
     """Result from the reasoning phase."""
     has_sufficient_info: bool
@@ -68,6 +89,7 @@ class AgentResponse:
     metrics: AgentMetrics
     execution_history: List[Dict[str, Any]] = field(default_factory=list)
     completion_status: Optional[Dict[str, Any]] = None
+    citations: List[Citation] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert response to dictionary."""
@@ -79,5 +101,6 @@ class AgentResponse:
             "result": result_value,
             "metrics": self.metrics.to_dict(),
             "execution_history": self.execution_history,
-            "completion_status": self.completion_status
+            "completion_status": self.completion_status,
+            "citations": [citation.to_dict() for citation in self.citations]
         }

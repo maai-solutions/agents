@@ -2,6 +2,7 @@
 
 from typing import Optional
 from pydantic import BaseModel, Field
+from linus.agents.graph.state import StateContextStrategy
 
 
 class LLMConfig(BaseModel):
@@ -32,12 +33,35 @@ class MemoryConfig(BaseModel):
     max_memory_size: Optional[int] = Field(default=100, description="Maximum number of memories to keep")
 
 
+class StateConfig(BaseModel):
+    """Configuration for shared state context management.
+
+    Attributes:
+        max_state_context_tokens: Maximum tokens for state context in prompts (None = no limit)
+        state_context_strategy: Strategy for managing state context (FULL, CLIP, or COMPACT)
+        summary_threshold_tokens: When to trigger summarization for COMPACT strategy
+    """
+    max_state_context_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum tokens for state context (None = no limit)"
+    )
+    state_context_strategy: StateContextStrategy = Field(
+        default=StateContextStrategy.FULL,
+        description="Strategy for managing state context"
+    )
+    summary_threshold_tokens: Optional[int] = Field(
+        default=None,
+        description="Token threshold for triggering summarization"
+    )
+
+
 class AgentParams(BaseModel):
     """Consolidated configuration for agent parameters.
 
     This class includes all configuration needed for an agent:
     - LLM generation parameters (temperature, max_tokens, top_p, top_k)
     - Memory configuration (enable_memory, memory_backend, max_context_tokens, max_memory_size)
+    - State configuration (max_state_context_tokens, state_context_strategy)
     - LLM connection settings (api_base, model, api_key)
 
     Attributes:
@@ -46,6 +70,7 @@ class AgentParams(BaseModel):
         top_p: Nucleus sampling parameter (0.0 to 1.0). Alternative to temperature
         top_k: Top-k sampling parameter. Only available on some models like Ollama
         memory_config: Memory management configuration
+        state_config: Shared state context management configuration
         llm_config: LLM connection and model settings
     """
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
@@ -53,4 +78,5 @@ class AgentParams(BaseModel):
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Nucleus sampling parameter")
     top_k: Optional[int] = Field(default=None, description="Top-k sampling parameter")
     memory_config: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory configuration")
+    state_config: StateConfig = Field(default_factory=StateConfig, description="State context configuration")
     llm_config: LLMConfig = Field(default_factory=LLMConfig, description="LLM connection settings")

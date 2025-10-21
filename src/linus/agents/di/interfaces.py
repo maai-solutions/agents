@@ -218,7 +218,8 @@ class NoOpTelemetry(ITelemetry):
     def trace_agent_run(
         self,
         user_input: str,
-        agent_type: str = "ReasoningAgent"
+        agent_type: str = "ReasoningAgent",
+        agent_name: Optional[str] = None
     ) -> AsyncContextManager:
         return nullcontext()
 
@@ -233,7 +234,8 @@ class NoOpTelemetry(ITelemetry):
         self,
         prompt: str,
         model: str,
-        call_type: str = "completion"
+        call_type: str = "completion",
+        llm_name: Optional[str] = None
     ) -> AsyncContextManager:
         return nullcontext()
 
@@ -241,6 +243,13 @@ class NoOpTelemetry(ITelemetry):
         self,
         tool_name: str,
         tool_args: Dict[str, Any]
+    ) -> AsyncContextManager:
+        return nullcontext()
+
+    def trace_subagent_execution(
+        self,
+        subagent_name: str,
+        input_data: str
     ) -> AsyncContextManager:
         return nullcontext()
 

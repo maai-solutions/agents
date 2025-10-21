@@ -1,0 +1,180 @@
+COORDINATORAGENT EXECUTION FLOW & CONTEXT PROPAGATION
+======================================================
+
+USER INPUT
+"Find information about Python, calculate compound interest on 50000 with 7% rate for 5 years, 
+and explain the results"
+    |
+    v
+COORDINATOR.RUN()
+    |
+    v
+=== ITERATION 1 ===
+    |
+    +---> BUILD_CONTEXT(input_text="Find info... calculate... explain...")
+    |     Returns: "[Original Request] Find info... calculate... explain..."
+    |
+    +---> _CREATE_PLAN(context)
+    |     LLM reads: "Find info... calculate... explain..."
+    |     Returns Plan:
+    |     [
+    |       Step 1: "Research Python" -> assign "researcher"
+    |       Step 2: "Calculate compound interest" -> assign "calculator"  
+    |       Step 3: "Explain results" -> assign "general_assistant"
+    |     ]
+    |
+    +---> _EXECUTE_PLAN(plan, history=[], original_request)
+    |     |
+    |     +---> EXECUTE_STEP(Step 1)
+    |     |      enriched_input = """Original request: Find info... calculate... explain...
+    |     |                        Current step: Research Python
+    |     |                        Previous results: (none)"""
+    |     |      |
+    |     |      +---> RESEARCHER_AGENT.RUN(enriched_input)
+    |     |             [Researcher enters its own 10-iteration loop]
+    |     |             Returns: "Python is... developed in 1991... versions..."
+    |     |
+    |     |      history = [Step 1: "Python is... developed in 1991..."]
+    |     |
+    |     +---> EXECUTE_STEP(Step 2)
+    |            enriched_input = """Original request: Find info... calculate... explain...
+    |                               Current step: Calculate compound interest
+    |                               Previous results:
+    |                               - Step 1: Python is... developed in 1991..."""
+    |            |
+    |            +---> CALCULATOR_AGENT.RUN(enriched_input)
+    |                   Returns: "50000 * (1.07^5) = 70128.80"
+    |
+    |     history = [Step 1: "Python...", Step 2: "50000 * 1.07^5 = 70128.80"]
+    |
+    +---> EXECUTE_STEP(Step 3) - SKIPPED (no dependencies met)
+    |
+    +---> _EVALUATE_PROGRESS(original_request, plan, history)
+    |     Evaluation prompt includes:
+    |     - Original request: "Find info... calculate... explain..."
+    |     - Original plan: [Step 1, 2, 3]
+    |     - History: [Step 1 result, Step 2 result]
+    |     
+    |     LLM Evaluation: "task_completed=false, next_action=continue"
+    |     (because Step 3 "Explain results" not done)
+    |
+    v
+=== ITERATION 2 ===
+    |
+    +---> BUILD_CONTEXT(input_text, history, plan)
+    |     context = """[Original Request] Find info... calculate... explain...
+    |                  [Previous Execution Results]
+    |                  - Step 1: Python...
+    |                  - Step 2: 50000 * 1.07^5...
+    |               """
+    |     
+    |     NOTE: Original request is included AGAIN!
+    |
+    +---> _CREATE_PLAN(context)  <-- PROBLEM 1: Re-planning from scratch
+    |     LLM reads context which includes:
+    |     1. Original request (again)
+    |     2. Only last 10 history items
+    |     
+    |     Possible outcomes:
+    |     A) Creates same plan: [Step 1, 2, 3]
+    |     B) Creates different plan: [Step 1, 2, 3, 4, ...]
+    |     C) Missing context of what was done
+    |
+    +---> _EXECUTE_PLAN(plan, history=[1,2])
+    |     |
+    |     +---> EXECUTE_STEP(Step 1)
+    |     |      Check: is step_number=1 in completed_steps?
+    |     |      completed_steps = {1, 2} (from history)
+    |     |      YES -> SKIP
+    |     |
+    |     +---> EXECUTE_STEP(Step 2)
+    |     |      Check: is step_number=2 in completed_steps?
+    |     |      YES -> SKIP
+    |     |
+    |     +---> EXECUTE_STEP(Step 3)
+    |            enriched_input = """Original request: Find info... calculate... explain...
+    |                               Current step: Explain results
+    |                               Previous results:
+    |                               - Step 1: Python...
+    |                               - Step 2: 50000 * 1.07^5..."""
+    |            |
+    |            +---> GENERAL_AGENT.RUN(enriched_input)
+    |                   [Agent sees full original request again!]
+    |                   Returns: "Based on my research, Python is..."
+    |
+    |     history = [Step 1, Step 2, Step 3: "Based on my research..."]
+    |
+    +---> _EVALUATE_PROGRESS(original_request, plan, history)
+    |     Evaluation: "task_completed=true, next_action=complete"
+    |
+    v
+LOOP EXITS - Return result
+
+=== CONTEXT PROPAGATION ISSUES ===
+
+1. ORIGINAL REQUEST APPEARS IN EVERY ITERATION
+   - Coordinator always includes input_text in context
+   - Each subagent gets original request, not just their step
+   - This can cause subagents to expand their scope
+
+2. HISTORY GROWS WITHOUT BOUND
+   - execution_history.extend(step_results) keeps growing
+   - Each new plan includes "last 10 items" which keeps the history visible
+   - Context window fills up quickly
+
+3. PLAN RE-CREATION EVERY ITERATION
+   - Each iteration asks LLM: "Create complete plan for X"
+   - Not: "What's the next step given we've done X, Y, Z?"
+   - LLM might plan differently each time
+
+4. STEP_NUMBER TRACKING ACROSS ITERATIONS
+   - In iteration 2+, if LLM creates different plan with different step numbers
+   - The skip logic (based on step_number matching) might fail
+   - Could lead to re-executing steps
+
+5. EVALUATION DECISION AMBIGUITY
+   - Evaluation asks: "Is task complete? Is plan still valid?"
+   - If LLM says "continue" or "replan", loop continues indefinitely
+   - No maximum successive "continue" checks
+
+=== WHEN DOES IT LOOP INFINITELY? ===
+
+Infinite Loop Condition:
+  while not is_complete and iteration < max_iterations:
+    - is_complete never becomes True
+    - evaluation_result["next_action"] never returns "complete"
+    
+Causes:
+  1. Evaluation prompt unclear -> LLM keeps saying "continue"
+  2. History grows but evaluation doesn't recognize completion
+  3. Different step_numbers in each plan -> skip logic doesn't work
+  4. Subagent's own internal loop doesn't complete (if subagent also has issues)
+
+=== COMPARISON: REASONINGAGENT (WORKS BETTER) ===
+
+REASONINGAGENT LOOP:
+  while not is_complete and iteration < max_iterations:
+    reasoning = await _reasoning_call(context)
+    # reasoning asks: "What TASKS REMAIN to be done?"
+    # Not: "What's the FULL PLAN?"
+    
+    for task in reasoning.tasks:
+      result = execute_task(task)
+    
+    completion = await _check_completion(input_text, history)
+    # check_completion has SAFEGUARDS:
+    # - If same tool called 3+ times in a row, force complete
+    # - Explicit check for repetitive behavior
+
+COORDINATORAGENT LOOP:
+  while not is_complete and iteration < max_iterations:
+    plan = await _create_plan(context)
+    # plan asks: "What's the COMPLETE PLAN?"
+    # Re-creates everything from scratch each iteration
+    
+    execute_plan(plan)
+    
+    evaluation = await _evaluate_progress(...)
+    # evaluation asks: "Is it complete? Should we replan?"
+    # No safeguard against perpetual "continue" decisions
+

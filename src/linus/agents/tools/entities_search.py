@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Type, List, Optional
 from pydantic import BaseModel, Field
@@ -144,6 +145,21 @@ class EntitiesSearchTool(BaseTool):
             limit=self.settings.wv_limit
         )
 
-    async def _arun(self, *args, **kwargs):
-        """Async version not implemented."""
-        raise NotImplementedError("Async vector search not supported")
+    async def _arun(self, query: str) -> str:
+        """Execute the hybrid search asynchronously.
+
+        Args:
+            query: Search query text
+
+        Returns:
+            Formatted search results
+        """
+        # Run synchronous hybrid_search in a thread pool to avoid blocking
+        return await asyncio.to_thread(
+            self.hybrid_search,
+            query,
+            collection=self.settings.wv_collection,
+            max_distance=self.settings.wv_max_distance,
+            alpha=self.settings.wv_alpha,
+            limit=self.settings.wv_limit
+        )

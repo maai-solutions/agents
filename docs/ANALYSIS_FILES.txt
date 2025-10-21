@@ -1,0 +1,202 @@
+COORDINATORAGENT INFINITE LOOP INVESTIGATION - COMPLETE ANALYSIS
+================================================================
+
+This directory now contains three comprehensive analysis documents:
+
+1. COORDINATOR_INFINITE_LOOP_ANALYSIS.md
+   Location: /Users/udg/Projects/ai/agents/COORDINATOR_INFINITE_LOOP_ANALYSIS.md
+   Size: ~14 KB
+   Contents:
+     - Executive summary
+     - Architecture overview  
+     - 5 root causes identified with code
+     - Concrete execution scenarios
+     - Why ReasoningAgent works better
+     - Detailed fix strategies (quick, medium, major)
+     - Code references with line numbers
+   Best for: Understanding the complete problem
+
+2. COORDINATOR_FLOW_DIAGRAM.txt
+   Location: /Users/udg/Projects/ai/agents/COORDINATOR_FLOW_DIAGRAM.txt
+   Size: ~6.9 KB
+   Contents:
+     - User input through complete flow
+     - Iteration 1 detailed walkthrough
+     - Iteration 2 detailed walkthrough
+     - Context propagation issues (5 identified)
+     - Infinite loop detection scenarios
+     - ReasoningAgent comparison
+   Best for: Visual understanding of the flow
+
+3. QUICK_REFERENCE.md
+   Location: /Users/udg/Projects/ai/agents/QUICK_REFERENCE.md
+   Size: Comprehensive quick lookup
+   Contents:
+     - Problem summary
+     - 6 critical code sections with line numbers
+     - The infinite loop sequence
+     - Quick fixes table (time + impact)
+     - Files to modify
+     - Testing instructions
+   Best for: Implementation and debugging
+
+=================================================================
+PRIMARY SOURCE CODE FILES
+=================================================================
+
+Main Implementation:
+  /Users/udg/Projects/ai/agents/src/linus/agents/agent/coordinator_agent.py
+  - 790 lines total
+  - Key methods:
+    * run() - lines 241-264
+    * _run_with_trace() - lines 266-406 [MAIN LOOP]
+    * _build_context() - lines 408-442 [CONTEXT REBUILDING]
+    * _create_plan() - lines 444-494 [FULL RE-PLANNING]
+    * _execute_plan() - lines 496-542 [SKIP LOGIC]
+    * _execute_step() - lines 544-622 [SUBAGENT INPUT]
+    * _evaluate_progress() - lines 624-693 [EVALUATION]
+
+Reference Implementation (Working):
+  /Users/udg/Projects/ai/agents/src/linus/agents/agent/reasoning_agent.py
+  - Has safeguards CoordinatorAgent lacks
+  - Key method: _check_completion() - lines 873-942
+  - Shows how to prevent infinite loops
+
+Base Class:
+  /Users/udg/Projects/ai/agents/src/linus/agents/agent/base.py
+  - Parent class with shared functionality
+
+Data Models:
+  /Users/udg/Projects/ai/agents/src/linus/agents/agent/models.py
+  - AgentMetrics - lines 27-61
+  - AgentResponse - lines 64-83
+
+Factory Functions:
+  /Users/udg/Projects/ai/agents/src/linus/agents/agent/factory.py
+  - Coordinator() function - lines 166-319
+  - Creates CoordinatorAgent instances
+
+=================================================================
+INTEGRATION POINTS
+=================================================================
+
+FastAPI Application:
+  /Users/udg/Projects/ai/agents/src/app.py
+  - Uses CoordinatorAgent
+  - Endpoints: /agent/query, /agent/reasoning, /agent/batch
+
+Example Usage:
+  /Users/udg/Projects/ai/agents/examples/example_coordinator_usage.py
+  - Demonstrates CoordinatorAgent usage
+  - Multiple example scenarios
+
+=================================================================
+ROOT CAUSES QUICK SUMMARY
+=================================================================
+
+1. Context Rebuilding with Original Request
+   File: coordinator_agent.py
+   Line: 415
+   Method: _build_context()
+   Issue: input_text always included, causes re-reading of full task
+
+2. Full Re-Planning Every Iteration
+   File: coordinator_agent.py
+   Lines: 296-344
+   Method: _run_with_trace()
+   Issue: Calls _create_plan() every iteration asking for FULL plan
+   
+3. No Safeguard Against Perpetual "Continue" Decisions
+   File: coordinator_agent.py
+   Lines: 333-340
+   Method: _run_with_trace()
+   Issue: No counter for consecutive "continue" responses
+   Compare: ReasoningAgent has this (reasoning_agent.py:883-894)
+
+4. Subagents Receive Full Original Request
+   File: coordinator_agent.py
+   Lines: 583-587
+   Method: _execute_step()
+   Issue: enriched_input includes original_request, not just step
+   Result: Subagent sees full task scope, not just its assignment
+
+5. Plan Execution Skip Logic May Fail
+   File: coordinator_agent.py
+   Lines: 513-520
+   Method: _execute_plan()
+   Issue: If plan recreated with different step_numbers, skip fails
+
+=================================================================
+QUICKEST FIXES
+=================================================================
+
+All fixable in ~30 minutes:
+
+1. Add "continue" counter - 5 mins
+   Location: coordinator_agent.py, lines 333-340
+   Impact: HIGHEST - prevents most infinite loops
+
+2. Remove original_request from subagent input - 10 mins
+   Location: coordinator_agent.py, lines 583-587
+   Impact: HIGH - reduces scope creep
+
+3. Add "replan" counter - 5 mins
+   Location: coordinator_agent.py, lines 335-337
+   Impact: MEDIUM - prevents replan loops
+
+4. Limit history in context to last 3-5 items - 5 mins
+   Location: coordinator_agent.py, lines 436-440
+   Impact: MEDIUM - cleaner context for LLM
+
+5. Add consecutive decision counter - 5 mins
+   Location: coordinator_agent.py, main loop
+   Impact: MEDIUM - forces completion after 3+ same decisions
+
+=================================================================
+HOW TO USE THESE ANALYSIS FILES
+=================================================================
+
+For Quick Understanding:
+  1. Start with QUICK_REFERENCE.md (5 min read)
+  2. Focus on "Critical Code Sections"
+  3. Note the line numbers for your IDE
+
+For Deep Understanding:
+  1. Read COORDINATOR_INFINITE_LOOP_ANALYSIS.md
+  2. Refer to COORDINATOR_FLOW_DIAGRAM.txt for visual flow
+  3. Cross-reference with actual source code
+
+For Implementation:
+  1. Use QUICK_REFERENCE.md to identify sections
+  2. Implement fixes in priority order
+  3. Test with provided test cases
+  4. Compare with ReasoningAgent safeguards
+
+For Debugging:
+  1. Check COORDINATOR_FLOW_DIAGRAM.txt for expected flow
+  2. Add logging at decision points (lines 333-340)
+  3. Watch for "continue" counter behavior
+  4. Monitor execution_history growth
+
+=================================================================
+GIT STATUS
+=================================================================
+
+Current Branch: dev
+Recent Commit: fd274ba "coordinator agent"
+Status: src/app.py modified, ui/ untracked
+
+The CoordinatorAgent was recently added (commit fd274ba)
+and likely hasn't been thoroughly tested yet.
+
+=================================================================
+RELATED DOCUMENTATION
+=================================================================
+
+In the codebase:
+  /Users/udg/Projects/ai/agents/CLAUDE.md - Project overview
+  /Users/udg/Projects/ai/agents/README.md - Setup instructions
+  /Users/udg/Projects/ai/agents/docs/TELEMETRY.md - Telemetry setup
+  /Users/udg/Projects/ai/agents/docs/LANGFUSE_INTEGRATION.md - Langfuse setup
+
+=================================================================

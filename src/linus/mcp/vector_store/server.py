@@ -226,8 +226,9 @@ class VectorStoreMCPServer:
                 return_metadata=MetadataQuery(score=True)
             )
 
-            # Format results and remove duplicates based on text content
+            # Format results with citations and remove duplicates based on text content
             results = []
+            citations = []
             seen_texts = set()  # Track unique text content to avoid duplicates
             num_results = len(response.objects)
             unique_results = 0
@@ -236,29 +237,59 @@ class VectorStoreMCPServer:
             for idx, obj in enumerate(response.objects, 1):
                 score = obj.metadata.score
                 content = obj.properties.get('text', '') or obj.properties.get('content', '')
-                metadata = {k: v for k, v in obj.properties.items() if k not in ['text', 'content', 'tags']}
+
+                # Extract citation metadata
+                document_id = obj.properties.get('document_id', obj.properties.get('doc_id', f'doc_{idx}'))
+                chunk_number = obj.properties.get('chunk_number', obj.properties.get('chunk_id', idx))
+
+                # Get other metadata (excluding text, content, tags, document_id, chunk_number)
+                metadata = {
+                    k: v for k, v in obj.properties.items()
+                    if k not in ['text', 'content', 'tags', 'document_id', 'doc_id', 'chunk_number', 'chunk_id']
+                }
 
                 # Skip duplicate content - compare normalized text (stripped and lowercased)
                 normalized_content = content.strip().lower()
                 if normalized_content in seen_texts:
                     logger.debug(f"Skipping duplicate content at position {idx} (score={score:.4f})")
                     continue
-                
+
                 # Add to seen texts to prevent future duplicates
                 seen_texts.add(normalized_content)
                 unique_results += 1
 
-                logger.debug(f"Result {unique_results}: score={score:.4f}, content_length={len(content)}")
+                logger.debug(f"Result {unique_results}: score={score:.4f}, content_length={len(content)}, doc={document_id}, chunk={chunk_number}")
 
-                result_str = f"{unique_results}. [Score: {score:.4f}]\n"
-                result_str += f"   Content: {content[:500]}{'...' if len(content) > 500 else ''}\n"
-                if metadata:
-                    result_str += f"   Metadata: {metadata}\n"
-                results.append(result_str)
+                # Create result entry
+                result_entry = {
+                    "rank": unique_results,
+                    "score": round(score, 4),
+                    "content": content[:500] + ('...' if len(content) > 500 else ''),
+                    "full_content": content,
+                    "document_id": document_id,
+                    "chunk_number": chunk_number,
+                    "metadata": metadata
+                }
+                results.append(result_entry)
+
+                # Create citation entry
+                citation = {
+                    "document_id": document_id,
+                    "chunk_number": chunk_number,
+                    "score": round(score, 4),
+                    "content_preview": content[:200] + ('...' if len(content) > 200 else '')
+                }
+                citations.append(citation)
 
             if not results:
                 logger.warning(f"No results found for query '{query}' within max_distance {_max_distance}")
-                return f"No content found for query '{query}' within max_distance {_max_distance}"
+                return json.dumps({
+                    "status": "no_results",
+                    "message": f"No content found for query '{query}' within max_distance {_max_distance}",
+                    "query": query,
+                    "results": [],
+                    "citations": []
+                })
 
             # Log search metrics with deduplication info
             search_metrics = {
@@ -274,16 +305,36 @@ class VectorStoreMCPServer:
             log_metrics(search_metrics, title="Vector Search Metrics", console=self.console)
 
             logger.info(f"✓ Vector search completed successfully with {unique_results} unique result(s) from {num_results} total (removed {num_results - unique_results} duplicates)")
+            logger.info(f"✓ Generated {len(citations)} citations")
 
-            header = f"Content search results for '{query}' (alpha={_alpha}, limit={_limit}, max_distance={_max_distance}):\n"
-            header += f"Showing {unique_results} unique results from {num_results} total (removed {num_results - unique_results} duplicates)\n\n"
-            return header + "\n".join(results)
+            # Return structured JSON response with citations
+            response_data = {
+                "status": "success",
+                "query": query,
+                "search_params": {
+                    "alpha": _alpha,
+                    "limit": _limit,
+                    "max_distance": _max_distance,
+                    "collection": _collection
+                },
+                "results": results,
+                "citations": citations,
+                "total_results": len(results),
+                "duplicates_removed": num_results - unique_results
+            }
+
+            return json.dumps(response_data, indent=2)
 
         except Exception as e:
             logger.exception(f"Error executing hybrid search: {e}")
-            error_msg = f"Error executing hybrid search: {str(e)}"
-            logger.error(error_msg)
-            return error_msg
+            error_response = {
+                "status": "error",
+                "message": f"Error executing hybrid search: {str(e)}",
+                "query": query,
+                "results": [],
+                "citations": []
+            }
+            return json.dumps(error_response)
 
     async def run(self):
         """Run the MCP server."""

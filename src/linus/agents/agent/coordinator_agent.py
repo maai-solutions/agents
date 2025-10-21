@@ -11,7 +11,7 @@ from openai import OpenAI, AsyncOpenAI
 from linus.agents.agent.memory import MemoryManager
 
 from .base import Agent
-from .models import AgentMetrics, AgentResponse
+from .models import AgentMetrics, AgentResponse, Citation
 from .tool_base import BaseTool
 from .config import AgentParams, MemoryConfig, LLMConfig
 from ..graph.state import SharedState
@@ -287,10 +287,14 @@ Response:"""
 
         # Track execution history
         execution_history = []
+        citations = []  # Collect citations from subagents
         iteration = 0
         current_plan = None
         is_complete = False
         evaluation_result = None
+        previous_history_len = 0  # Track progress between iterations
+        consecutive_continues = 0  # Track consecutive "continue" actions
+        consecutive_replans = 0  # Track consecutive "replan" actions
 
         # Coordinator loop: plan -> execute -> evaluate -> replan if needed
         while not is_complete and iteration < self.max_iterations:
@@ -313,8 +317,19 @@ Response:"""
             # Phase 2: Execute plan steps
             step_results = await self._execute_plan(current_plan, execution_history, input_text)
 
-            # Add step results to history
-            execution_history.extend(step_results)
+            # Add step results to history and collect citations
+            for step_result in step_results:
+                execution_history.append(step_result)
+                # Collect citations from this step
+                if "citations" in step_result and step_result["citations"]:
+                    citations.extend(step_result["citations"])
+                    self.logger.debug(f"[COORDINATOR] Collected {len(step_result['citations'])} citations from step {step_result['step_number']}")
+
+            # Check for progress - if no new steps executed, we may be stalled
+            if len(execution_history) == previous_history_len:
+                self.logger.warning(f"[COORDINATOR] No progress made in iteration {iteration}")
+            else:
+                previous_history_len = len(execution_history)
 
             # Phase 3: Evaluate progress
             evaluation_result = await self._evaluate_progress(
@@ -332,12 +347,31 @@ Response:"""
             # Determine next action
             if evaluation_result["next_action"] == "complete":
                 is_complete = True
+                consecutive_continues = 0
+                consecutive_replans = 0
             elif evaluation_result["next_action"] == "replan":
-                self.logger.info("[COORDINATOR] Replanning based on evaluation")
-                # Loop continues with replanning
+                consecutive_replans += 1
+                consecutive_continues = 0  # Reset continue counter
+
+                # Force completion after 3 consecutive replans
+                if consecutive_replans >= 3:
+                    self.logger.warning("[COORDINATOR] Too many consecutive replans, forcing completion")
+                    is_complete = True
+                    evaluation_result["completion_summary"] = await self._format_final_response(input_text, execution_history)
+                else:
+                    self.logger.info(f"[COORDINATOR] Replanning based on evaluation (replan #{consecutive_replans})")
             elif evaluation_result["next_action"] == "continue":
-                # Plan was executed, check if actually complete
-                is_complete = evaluation_result["task_completed"]
+                consecutive_continues += 1
+                consecutive_replans = 0  # Reset replan counter
+
+                # Force completion after 3 consecutive continues with no progress
+                if consecutive_continues >= 3:
+                    self.logger.warning("[COORDINATOR] Too many consecutive continues with no progress, forcing completion")
+                    is_complete = True
+                    evaluation_result["completion_summary"] = await self._format_final_response(input_text, execution_history)
+                else:
+                    # Plan was executed, check if actually complete
+                    is_complete = evaluation_result["task_completed"]
 
             if not is_complete and iteration >= self.max_iterations:
                 self.logger.warning(f"[COORDINATOR] Max iterations reached")
@@ -396,11 +430,16 @@ Response:"""
 
         # Return based on return_metrics flag
         if return_metrics:
+            # Log total citations collected
+            if citations:
+                self.logger.info(f"[COORDINATOR] Collected {len(citations)} total citations from subagents")
+
             return AgentResponse(
                 result=formatted_result,
                 metrics=metrics,
                 execution_history=execution_history,
-                completion_status=evaluation_result
+                completion_status=evaluation_result,
+                citations=citations
             )
         else:
             return formatted_result
@@ -412,7 +451,11 @@ Response:"""
         current_plan: Optional[Dict[str, Any]]
     ) -> str:
         """Build context for planning including history and memory."""
-        context = input_text
+        # If replanning (history exists), focus on what's left to do
+        if execution_history:
+            context = f"Task progress update for: {input_text}"
+        else:
+            context = input_text
 
         # Add memory context if available
         if self.memory_manager:
@@ -425,10 +468,15 @@ Response:"""
             if memory_context:
                 context = f"{memory_context}\n\n=== Current Task ===\n{context}"
 
-        # Add state context
-        state_data = self.state.get_all()
-        if state_data:
-            state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in state_data.items()})}"
+        # Add state context (with token management)
+        from linus.agents.graph.state import StateContextStrategy
+
+        state_context = self.state.get_context(
+            strategy=getattr(self.state, 'context_strategy', StateContextStrategy.FULL),
+            max_tokens=getattr(self.state, 'max_context_tokens', None),
+            include_summary=True
+        )
+        if state_context:
             context = context + state_context
 
         # Add execution history if replanning
@@ -466,8 +514,10 @@ Response:"""
             except Exception:
                 pass
 
+        # Combine system prompt with user context to capture the full prompt in tracing
+        full_planning_prompt = f"{self.planning_prompt}{context}"
         async with self.telemetry.trace_llm_call(
-            context, self.model, "planning", llm_name=self.model
+            full_planning_prompt, self.model, "planning", llm_name=self.model
         ):
             response = await self.llm.chat.completions.create(
                 messages=messages,
@@ -486,6 +536,22 @@ Response:"""
 
                 # Update metrics
                 self._update_token_usage(response)
+
+                # Record the generated plan in Langfuse (if Langfuse tracer is active)
+                if hasattr(self.telemetry, "update_generation"):
+                    # Extract usage information if available
+                    usage = None
+                    if hasattr(response, "usage") and response.usage:
+                        usage = {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        }
+                    self.telemetry.update_generation(
+                        output=plan,
+                        usage=usage,
+                    )
+                    self.logger.debug("[COORDINATOR-PLAN] Updated generation with plan output")
 
                 return plan
 
@@ -510,7 +576,15 @@ Response:"""
             List of step execution results
         """
         step_results = []
-        completed_steps = {item["step_number"] for item in execution_history}
+        # Only count successfully completed steps for dependency checking
+        # Include both previous history AND current iteration results
+        completed_steps = {
+            item["step_number"] for item in execution_history
+            if item.get("status") == "completed"
+        }
+
+        self.logger.debug(f"[COORDINATOR-EXEC] Completed steps from history: {completed_steps}")
+        self.logger.debug(f"[COORDINATOR-EXEC] Total history items: {len(execution_history)}")
 
         for step in plan["plan"]:
             step_number = step["step_number"]
@@ -522,22 +596,41 @@ Response:"""
 
             # Check dependencies
             dependencies = step.get("dependencies", [])
-            if not all(dep in completed_steps for dep in dependencies):
+            if dependencies and not all(dep in completed_steps for dep in dependencies):
                 self.logger.warning(
-                    f"[COORDINATOR-EXEC] Step {step_number} dependencies not met, skipping"
+                    f"[COORDINATOR-EXEC] Step {step_number} dependencies {dependencies} not met. "
+                    f"Completed: {completed_steps}"
                 )
                 step_results.append({
                     "step_number": step_number,
                     "subagent": step["assigned_subagent"],
                     "status": "skipped",
-                    "result": "Dependencies not met"
+                    "result": f"Dependencies not met: requires {dependencies}, have {completed_steps}"
                 })
                 continue
 
             # Execute step
             result = await self._execute_step(step, execution_history, original_request)
             step_results.append(result)
-            completed_steps.add(step_number)
+
+            # Add to completed_steps immediately if successful so subsequent steps can depend on it
+            if result.get("status") == "completed":
+                completed_steps.add(step_number)
+                self.logger.debug(f"[COORDINATOR-EXEC] Step {step_number} completed, updated completed_steps: {completed_steps}")
+
+                # Store full result in shared state for other agents to access
+                state_key = f"step_{step_number}_result"
+                self.state.set(
+                    key=state_key,
+                    value=result.get("result"),
+                    source=result.get("subagent"),
+                    metadata={
+                        "step_number": step_number,
+                        "description": result.get("description"),
+                        "status": result.get("status")
+                    }
+                )
+                self.logger.debug(f"[COORDINATOR-STATE] Stored {state_key} in shared state")
 
         return step_results
 
@@ -580,35 +673,60 @@ Response:"""
         subagent = self.subagent_map[subagent_name]
 
         # Prepare input with context
-        enriched_input = f"""Original request: {original_request}
+        # Only include original request for first step to avoid scope creep
+        if not execution_history:
+            enriched_input = f"""Original request: {original_request}
 
 Current step: {step['description']}
 
 {step_input}"""
+        else:
+            enriched_input = f"""Step objective: {step['description']}
 
-        # Add relevant previous results
+Task details: {step_input}"""
+
+        # Add relevant previous results from shared state
         if execution_history:
-            prev_results = "\n".join([
-                f"- Step {item['step_number']}: {item['result'][:150]}"
-                for item in execution_history[-3:]
-            ])
-            enriched_input += f"\n\nPrevious results:\n{prev_results}"
+            prev_results_list = []
+            for item in execution_history[-3:]:  # Last 3 steps
+                step_num = item['step_number']
+                state_key = f"step_{step_num}_result"
+                # Get full result from shared state (not truncated)
+                full_result = self.state.get(state_key)
+                if full_result:
+                    prev_results_list.append(f"- Step {step_num}: {full_result}")
+                else:
+                    # Fallback to truncated result if not in state
+                    prev_results_list.append(f"- Step {step_num}: {item['result'][:150]}")
+
+            if prev_results_list:
+                enriched_input += f"\n\nPrevious results:\n" + "\n".join(prev_results_list)
 
         try:
             # Execute subagent (use hierarchical tracing)
             async with self.telemetry.trace_subagent_execution(
                 subagent_name, enriched_input
             ):
-                result = await subagent.agent.run(enriched_input, return_metrics=False)
+                # Get full AgentResponse to collect citations
+                result = await subagent.agent.run(enriched_input, return_metrics=True)
 
                 self.logger.info(f"[COORDINATOR-EXEC] Step {step_number} completed")
+
+                # Extract result text and citations
+                if isinstance(result, AgentResponse):
+                    result_text = str(result.result)
+                    step_citations = result.citations if result.citations else []
+                else:
+                    result_text = str(result)
+                    step_citations = []
 
                 return {
                     "step_number": step_number,
                     "subagent": subagent_name,
                     "description": step["description"],
                     "status": "completed",
-                    "result": str(result)
+                    "result": result_text,
+                    "citations": step_citations
                 }
 
         except Exception as e:
@@ -618,7 +736,8 @@ Current step: {step['description']}
                 "subagent": subagent_name,
                 "description": step["description"],
                 "status": "failed",
-                "result": f"Error: {str(e)}"
+                "result": f"Error: {str(e)}",
+                "citations": []
             }
 
     @trace_method("coordinator.evaluation")
@@ -645,11 +764,25 @@ Current step: {step['description']}
             for s in current_plan.get("plan", [])
         ])
 
-        history_summary = "\n".join([
-            f"Step {item['step_number']}: {item['subagent']} - "
-            f"Status: {item['status']}, Result: {item['result'][:200]}"
-            for item in execution_history
-        ])
+        # Build history summary with full results from shared state
+        history_parts = []
+        for item in execution_history:
+            step_num = item['step_number']
+            state_key = f"step_{step_num}_result"
+            # Get full result from shared state (not truncated)
+            full_result = self.state.get(state_key)
+            if full_result:
+                history_parts.append(
+                    f"Step {step_num}: {item['subagent']} - "
+                    f"Status: {item['status']}, Result: {full_result}"
+                )
+            else:
+                # Fallback to truncated result if not in state
+                history_parts.append(
+                    f"Step {step_num}: {item['subagent']} - "
+                    f"Status: {item['status']}, Result: {item['result'][:200]}"
+                )
+        history_summary = "\n".join(history_parts)
 
         prompt = self.evaluation_prompt.format(
             original_request=original_request,
@@ -669,6 +802,8 @@ Current step: {step['description']}
                 messages=messages,
                 **self._get_generation_kwargs()
             )
+            # Record token usage
+            self._update_token_usage(response)
 
             try:
                 response_text = response.choices[0].message.content
@@ -678,7 +813,21 @@ Current step: {step['description']}
                 else:
                     evaluation = json.loads(response_text)
 
-                self._update_token_usage(response)
+                # Record the evaluation result in Langfuse (if Langfuse tracer is active)
+                if hasattr(self.telemetry, "update_generation"):
+                    usage = None
+                    if hasattr(response, "usage") and response.usage:
+                        usage = {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        }
+                    self.telemetry.update_generation(
+                        output=evaluation,
+                        usage=usage,
+                    )
+                    self.logger.debug("[COORDINATOR-EVAL] Updated generation with evaluation output")
+
                 return evaluation
 
             except (json.JSONDecodeError, KeyError) as e:
@@ -718,13 +867,21 @@ Current step: {step['description']}
             return "I attempted to process your request but encountered errors."
 
         if len(successful_results) == 1:
-            return successful_results[0]["result"]
+            # Get full result from shared state
+            step_num = successful_results[0]["step_number"]
+            state_key = f"step_{step_num}_result"
+            full_result = self.state.get(state_key)
+            return full_result if full_result else successful_results[0]["result"]
 
-        # Combine multiple results
-        combined = "\n\n".join([
-            f"Step {item['step_number']} ({item['subagent']}): {item['result']}"
-            for item in successful_results
-        ])
+        # Combine multiple results with full data from shared state
+        combined_parts = []
+        for item in successful_results:
+            step_num = item['step_number']
+            state_key = f"step_{step_num}_result"
+            full_result = self.state.get(state_key)
+            result_text = full_result if full_result else item['result']
+            combined_parts.append(f"Step {step_num} ({item['subagent']}): {result_text}")
+        combined = "\n\n".join(combined_parts)
 
         # Use LLM to create coherent response
         messages = [
@@ -738,6 +895,24 @@ Current step: {step['description']}
                 **self._get_generation_kwargs()
             )
             self._update_token_usage(response)
+
+            # Record the final LLM generation in Langfuse (if Langfuse tracer is active)
+            if hasattr(self.telemetry, "update_generation"):
+                usage = None
+                if hasattr(response, "usage") and response.usage:
+                    usage = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+                # The response text is the final answer
+                final_output = response.choices[0].message.content
+                self.telemetry.update_generation(
+                    output={"response": final_output},
+                    usage=usage,
+                )
+                self.logger.debug("[COORDINATOR-FINAL] Updated generation with final response")
+
             return response.choices[0].message.content
         except Exception as e:
             self.logger.exception(f"[COORDINATOR] Error formatting final response: {e}")

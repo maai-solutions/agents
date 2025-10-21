@@ -1,4 +1,6 @@
-from typing import Type, List, Optional
+import asyncio
+import json
+from typing import Type, List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 import weaviate
 from weaviate.classes.query import MetadataQuery
@@ -80,7 +82,7 @@ class VectorStoreTool(BaseTool):
             limit: Maximum number of results (defaults to settings.wv_limit)
 
         Returns:
-            Formatted string with search results
+            JSON string with search results and citations
         """
         # Use settings defaults if not provided
         _collection = collection if collection is not None else self.settings.wv_collection
@@ -90,7 +92,7 @@ class VectorStoreTool(BaseTool):
 
         try:
             collection = self.client.collections.get(_collection)
-            
+
             vector = self.embedding(query)
 
             # Perform hybrid search
@@ -103,27 +105,79 @@ class VectorStoreTool(BaseTool):
                 return_metadata=MetadataQuery(score=True)
             )
 
-            # Filter by max_distance and format results
+            # Format results with citations
             results = []
+            citations = []
+
             for idx, obj in enumerate(response.objects, 1):
                 score = obj.metadata.score
                 content = obj.properties.get('text', '') or obj.properties.get('content', '')
-                metadata = {k: v for k, v in obj.properties.items() if k not in ['text', 'content', 'tags']}
 
-                result_str = f"{idx}. [Score: {score:.4f}]\n"
-                result_str += f"   Content: {content[:500]}{'...' if len(content) > 500 else ''}\n"
-                if metadata:
-                    result_str += f"   Metadata: {metadata}\n"
-                results.append(result_str)
+                # Extract citation information from metadata
+                document_id = obj.properties.get('document_id', obj.properties.get('doc_id', 'unknown'))
+                chunk_number = obj.properties.get('chunk_number', obj.properties.get('chunk_id', idx))
+
+                # Get other metadata (excluding text, content, tags, document_id, chunk_number)
+                metadata = {
+                    k: v for k, v in obj.properties.items()
+                    if k not in ['text', 'content', 'tags', 'document_id', 'doc_id', 'chunk_number', 'chunk_id']
+                }
+
+                # Create result entry
+                result_entry = {
+                    "rank": idx,
+                    "score": round(score, 4),
+                    "content": content[:500] + ('...' if len(content) > 500 else ''),
+                    "full_content": content,
+                    "document_id": document_id,
+                    "chunk_number": chunk_number,
+                    "metadata": metadata
+                }
+                results.append(result_entry)
+
+                # Create citation entry
+                citation = {
+                    "document_id": document_id,
+                    "chunk_number": chunk_number,
+                    "score": round(score, 4),
+                    "content_preview": content[:200] + ('...' if len(content) > 200 else '')
+                }
+                citations.append(citation)
 
             if not results:
-                return f"No content found for query '{query}' within max_distance {_max_distance}"
+                return json.dumps({
+                    "status": "no_results",
+                    "message": f"No content found for query '{query}' within max_distance {_max_distance}",
+                    "query": query,
+                    "results": [],
+                    "citations": []
+                })
 
-            header = f"Content search results for '{query}' (alpha={_alpha}, limit={_limit}, max_distance={_max_distance}):\n\n"
-            return header + "\n".join(results)
+            # Return structured JSON response
+            response_data = {
+                "status": "success",
+                "query": query,
+                "search_params": {
+                    "alpha": _alpha,
+                    "limit": _limit,
+                    "max_distance": _max_distance
+                },
+                "results": results,
+                "citations": citations,
+                "total_results": len(results)
+            }
+
+            return json.dumps(response_data, indent=2)
 
         except Exception as e:
-            return f"Error executing hybrid search: {str(e)}"
+            error_response = {
+                "status": "error",
+                "message": f"Error executing hybrid search: {str(e)}",
+                "query": query,
+                "results": [],
+                "citations": []
+            }
+            return json.dumps(error_response)
 
     def _run(
         self,
@@ -145,6 +199,21 @@ class VectorStoreTool(BaseTool):
             limit=self.settings.wv_limit
         )
 
-    async def _arun(self, *args, **kwargs):
-        """Async version not implemented."""
-        raise NotImplementedError("Async vector search not supported")
+    async def _arun(self, query: str) -> str:
+        """Execute the hybrid search asynchronously.
+
+        Args:
+            query: Search query text
+
+        Returns:
+            Formatted search results
+        """
+        # Run synchronous hybrid_search in a thread pool to avoid blocking
+        return await asyncio.to_thread(
+            self.hybrid_search,
+            query,
+            collection=self.settings.wv_collection,
+            max_distance=self.settings.wv_max_distance,
+            alpha=self.settings.wv_alpha,
+            limit=self.settings.wv_limit
+        )

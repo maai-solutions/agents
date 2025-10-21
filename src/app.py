@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 
 from linus.agents.agent.mcp_client import MCPServerConfig, connect_mcp_servers
+from linus.agents.agent.memory import InMemoryBackend, MemoryManager
 from linus.agents.tools.entities_search import EntitiesSearchTool
 
 # Load .env from src directory (where this file is located)
@@ -86,6 +87,14 @@ class AgentRequest(BaseModel):
     max_iterations: Optional[int] = Field(default=10, description="Maximum iterations for agent execution")
 
 
+class Citation(BaseModel):
+    """Citation model for API responses."""
+    document_id: str
+    chunk_number: int
+    score: Optional[float] = None
+    content_preview: Optional[str] = None
+
+
 class AgentResponse(BaseModel):
     """Response model for agent interactions."""
 
@@ -98,6 +107,7 @@ class AgentResponse(BaseModel):
     session_id: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
     model_params: Optional[Dict[str, Any]] = None
+    citations: List[Citation] = Field(default_factory=list, description="Citations from vector search results")
 
 
 class HealthResponse(BaseModel):
@@ -150,10 +160,10 @@ async def lifespan(app: FastAPI):
                 command="docker",
                 args=["run", "-i", "--rm", "mcp/time"]
             ),
-            "sequentialthinking": MCPServerConfig(
-                command="docker",
-                args=["run", "-i", "--rm", "mcp/sequentialthinking"]
-            ),
+            # "sequentialthinking": MCPServerConfig(
+            #     command="docker",
+            #     args=["run", "-i", "--rm", "mcp/sequentialthinking"]
+            # ),
             "memory": MCPServerConfig(
                 command="docker",
                 args=["run", "-i", "--rm", "-v", "/Users/udg/Projects/ai/agents/memory:/memory", "mcp/memory"]
@@ -189,6 +199,11 @@ async def lifespan(app: FastAPI):
         # Add EntitiesSearchTool
         entities_search_tool = EntitiesSearchTool()
 
+        # Create shared state for all agents
+        from linus.agents.graph.state import SharedState
+        shared_state = SharedState()
+        logger.info("[STATE] Created shared state for agent coordination")
+
         # Create Researcher subagent
         logger.info("[SUBAGENT] Creating Researcher agent...")
         researcher_tools = [entities_search_tool]
@@ -210,7 +225,9 @@ async def lifespan(app: FastAPI):
             verbose=settings.agent_verbose,
             tracer=tracer,
             use_async=True,
-            agent_name="Researcher"
+            agent_name="Researcher",
+            state=shared_state,
+            enable_memory=True
         )
         logger.info(f"[SUBAGENT] Researcher created with {len(researcher_tools)} tools")
 
@@ -236,7 +253,8 @@ async def lifespan(app: FastAPI):
             verbose=settings.agent_verbose,
             tracer=tracer,
             use_async=True,
-            agent_name="Jacksmith"
+            agent_name="Jacksmith",
+            state=shared_state
         )
         logger.info(f"[SUBAGENT] Jacksmith created with {len(jacksmith_tools)} tools")
 
@@ -262,7 +280,9 @@ async def lifespan(app: FastAPI):
             verbose=settings.agent_verbose,
             tracer=tracer,
             use_async=True,
-            agent_name="Reasoner"
+            agent_name="Reasoner",
+            state=shared_state,
+            enable_memory=True
         )
         logger.info(f"[SUBAGENT] Reasoner created with {len(reasoner_tools)} tools")
 
@@ -304,6 +324,13 @@ async def lifespan(app: FastAPI):
 
         # Create CoordinatorAgent
         logger.info("[COORDINATOR] Creating CoordinatorAgent...")
+        memory = MemoryManager(
+            backend=InMemoryBackend(max_size=1000),
+            max_context_tokens=4096,
+            summary_threshold_tokens=2048,
+            llm=researcher_agent.llm, # optional for summarisation
+            model=settings.llm_model
+        )
         coordinator = CoordinatorAgent(
             llm=researcher_agent.llm,  # Use same LLM client
             model=settings.llm_model,
@@ -315,9 +342,11 @@ async def lifespan(app: FastAPI):
             top_k=settings.llm_top_k,
             api_base=settings.llm_api_base,
             max_iterations=15,
+            state=shared_state,  # Share state with all subagents
             logger=None,  # Use DI container
             telemetry=tracer,
-            agent_name="Coordinator"
+            agent_name="Coordinator",
+            memory_manager=memory
         )
 
         logger.info(f"[COORDINATOR] Initialized with {len(subagents)} subagents")
@@ -422,12 +451,26 @@ async def query_agent(request: AgentRequest):
 
             # Extract metrics
             metrics = agent_response.metrics.to_dict() if agent_response.metrics else None
+
+            # Extract citations
+            citations = []
+            if agent_response.citations:
+                citations = [
+                    Citation(
+                        document_id=citation.document_id,
+                        chunk_number=citation.chunk_number,
+                        score=citation.score,
+                        content_preview=citation.content_preview
+                    )
+                    for citation in agent_response.citations
+                ]
         else:
             # Fallback for string response
             result_text = str(agent_response)
             subagents_used = []
             reasoning = None
             metrics = None
+            citations = []
 
         # Extract model parameters
         model_params = {
@@ -448,7 +491,8 @@ async def query_agent(request: AgentRequest):
             timestamp=datetime.now().isoformat(),
             session_id=request.session_id,
             metrics=metrics,
-            model_params=model_params
+            model_params=model_params,
+            citations=citations
         )
 
         # Store in conversation history
@@ -537,19 +581,40 @@ async def batch_queries(queries: List[str]):
             # Extract string result from AgentResponse
             if isinstance(agent_response, AgentResponseData):
                 result_text = str(agent_response.result)
+
+                # Extract citations if available
+                citations = []
+                if agent_response.citations:
+                    citations = [
+                        {
+                            "document_id": citation.document_id,
+                            "chunk_number": citation.chunk_number,
+                            "score": citation.score,
+                            "content_preview": citation.content_preview
+                        }
+                        for citation in agent_response.citations
+                    ]
+
+                results.append({
+                    "query": query,
+                    "response": result_text,
+                    "citations": citations,
+                    "status": "success"
+                })
             else:
                 result_text = str(agent_response)
-
-            results.append({
-                "query": query,
-                "response": result_text,
-                "status": "success"
-            })
+                results.append({
+                    "query": query,
+                    "response": result_text,
+                    "citations": [],
+                    "status": "success"
+                })
         except Exception as e:
             results.append({
                 "query": query,
                 "error": str(e),
-                "status": "failed"
+                "status": "failed",
+                "citations": []
             })
 
     return {"results": results}

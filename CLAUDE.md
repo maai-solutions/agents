@@ -51,6 +51,11 @@ python test_api.py
 python example_rich_logging.py
 ```
 
+**Test citation support:**
+```bash
+python test_citations.py
+```
+
 ### Configuration
 Environment variables are configured in `.env`:
 
@@ -290,11 +295,115 @@ response = await agent.run("Calculate 100 + 200")
     "completion_status": {
         "is_complete": true,
         "reasoning": "Task completed successfully"
-    }
+    },
+    "citations": [
+        {
+            "document_id": "doc_12345",
+            "chunk_number": 3,
+            "score": 0.9234,
+            "content_preview": "Preview of cited content..."
+        }
+    ]
 }
 ```
 
 To get just the result string: `agent.run(query, return_metrics=False)`
+
+### Citations
+
+The agent framework automatically collects citations when using the `vector_search` tool. Citations track the source documents and chunks that contributed to the response.
+
+**Accessing citations:**
+```python
+response = await agent.run("What is the Ukraine conflict about?")
+
+# Access citations
+if response.citations:
+    for citation in response.citations:
+        print(f"Source: {citation.document_id}, Chunk: {citation.chunk_number}")
+        print(f"Score: {citation.score:.4f}")
+        print(f"Preview: {citation.content_preview}")
+```
+
+**Citation format:**
+- `document_id`: Unique identifier for the source document
+- `chunk_number`: Chunk/section number within the document
+- `score`: Relevance score (0.0 to 1.0)
+- `content_preview`: Preview of the cited content
+
+See [docs/CITATIONS.md](docs/CITATIONS.md) for detailed documentation on citation support.
+
+### State Context Management
+
+When working with large shared state dictionaries, the framework provides strategies to prevent prompt overflow:
+
+**Three strategies:**
+1. **FULL** - Include all state (no truncation, default)
+2. **CLIP** - Keep only most recent entries
+3. **COMPACT** - LLM-based summarization
+
+**Example with CLIP strategy:**
+```python
+from linus.agents.graph.state import SharedState, StateContextStrategy
+
+# Create state with token limit and CLIP strategy
+state = SharedState(
+    max_context_tokens=1000,  # Limit state to 1000 tokens
+    context_strategy=StateContextStrategy.CLIP
+)
+
+# Add many state entries
+for i in range(50):
+    state.set(f"step_{i}_result", f"Result from step {i}...")
+
+# Only recent entries that fit within 1000 tokens will be included
+context = state.get_context()
+stats = state.get_state_stats()
+print(f"Kept {stats['total_entries']} entries in {stats['total_tokens']} tokens")
+```
+
+**Example with COMPACT strategy (LLM summarization):**
+```python
+from openai import AsyncOpenAI
+from linus.agents.graph.state import SharedState, StateContextStrategy
+
+# LLM client for summarization
+llm_client = AsyncOpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="not-needed"
+)
+
+state = SharedState(
+    max_context_tokens=500,
+    llm_client=llm_client,
+    model="gemma3:27b",
+    context_strategy=StateContextStrategy.COMPACT
+)
+
+# Add large state
+state.set("analysis", "Very long analysis with thousands of words...")
+state.set("database_results", "Large dataset with 10000 rows...")
+
+# LLM will automatically summarize when getting context
+context = state.get_context()  # Returns concise summary
+```
+
+**Using with agents:**
+```python
+from linus.agents.agent.factory import Agent
+
+agent = Agent(
+    api_base="http://localhost:11434/v1",
+    model="gemma3:27b",
+    state=state,  # Agent uses configured strategy automatically
+    use_async=True
+)
+
+# State context is automatically managed during agent execution
+response = await agent.run("Continue from previous steps")
+```
+
+See [docs/STATE_CONTEXT_MANAGEMENT.md](docs/STATE_CONTEXT_MANAGEMENT.md) for comprehensive guide and examples.
 
 ### Using Langfuse for Observability
 

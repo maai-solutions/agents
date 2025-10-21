@@ -11,7 +11,7 @@ from openai import OpenAI, AsyncOpenAI
 from linus.agents.agent.memory import MemoryManager
 
 from .base import Agent
-from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse
+from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse, Citation
 from .tool_base import BaseTool
 from .config import AgentParams, MemoryConfig, LLMConfig
 from ..graph.state import SharedState
@@ -259,6 +259,7 @@ Response:"""
 
         # Track execution history for all iterations
         execution_history = []
+        citations = []  # Collect citations from tool results
         iteration = 0
         is_complete = False
         completion_status = None
@@ -287,10 +288,17 @@ Response:"""
                     context = f"{memory_context}\n\n=== Current Task ===\n{context}"
                     self.logger.debug(f"[MEMORY] Added {memory_tokens} token memory context")
 
-            # Add state context if available
-            state_data = self.state.get_all()
-            if state_data:
-                state_context = f"\n\nShared state: {json.dumps({k: str(v) for k, v in state_data.items()})}"
+            # Add state context if available (with token management)
+            # Use the strategy configured on the shared state
+            from linus.agents.graph.state import StateContextStrategy
+
+            # Get state context with automatic strategy selection
+            state_context = self.state.get_context(
+                strategy=getattr(self.state, 'context_strategy', StateContextStrategy.FULL),
+                max_tokens=getattr(self.state, 'max_context_tokens', None),
+                include_summary=True
+            )
+            if state_context:
                 context = context + state_context
 
             if execution_history:
@@ -329,6 +337,38 @@ Response:"""
                     # Generate tool arguments and execute
                     task_result = await self._execute_task_with_tool(task, context)
                     iteration_results.append(task_result)
+
+                    # Extract citations from any tool that returns structured data with citations
+                    # Tool-agnostic: check if the result contains a "citations" field
+                    self.logger.debug(f"[CITATIONS] Checking tool '{task.tool_name}' for citations")
+                    self.logger.debug(f"[CITATIONS] Task result type: {type(task_result)}, length: {len(str(task_result))}")
+                    try:
+                        result_data = json.loads(task_result)
+                        self.logger.debug(f"[CITATIONS] Successfully parsed JSON, keys: {result_data.keys()}")
+
+                        if "citations" in result_data:
+                            citation_list = result_data["citations"]
+                            self.logger.info(f"[CITATIONS] Found 'citations' key in tool '{task.tool_name}' with {len(citation_list)} items")
+
+                            if isinstance(citation_list, list):
+                                for idx, citation_data in enumerate(citation_list):
+                                    self.logger.debug(f"[CITATIONS] Processing citation {idx + 1}: {citation_data}")
+                                    citation = Citation(
+                                        document_id=citation_data.get("document_id", "unknown"),
+                                        chunk_number=citation_data.get("chunk_number", 0),
+                                        score=citation_data.get("score"),
+                                        content_preview=citation_data.get("content_preview")
+                                    )
+                                    citations.append(citation)
+                                self.logger.info(f"[CITATIONS] Successfully extracted {len(citation_list)} citations from tool '{task.tool_name}'")
+                            else:
+                                self.logger.warning(f"[CITATIONS] 'citations' key exists but is not a list: {type(citation_list)}")
+                        else:
+                            self.logger.debug(f"[CITATIONS] No 'citations' key in result_data from tool '{task.tool_name}'. Available keys: {list(result_data.keys())}")
+                    except json.JSONDecodeError as e:
+                        self.logger.debug(f"[CITATIONS] Tool result is not JSON (tool: {task.tool_name}): {e}")
+                    except (KeyError, TypeError) as e:
+                        self.logger.warning(f"[CITATIONS] Error extracting citations from parsed JSON (tool: {task.tool_name}): {e}")
 
                     # Record in execution history
                     execution_history.append({
@@ -382,7 +422,7 @@ Response:"""
         else:
             self.logger.warning(f"[RUN] Task incomplete after {iteration} iteration(s)")
 
-        final_result = await self._format_final_response_with_history(input_text, execution_history, completion_status)
+        final_result = await self._format_final_response_with_history(input_text, execution_history, completion_status, citations)
 
         # Format output according to schema and save to state
         formatted_result = self._format_output(final_result)
@@ -424,6 +464,12 @@ Response:"""
         if hasattr(self.telemetry, 'flush'):
             self.telemetry.flush()
 
+        # Log citations summary
+        self.logger.info(f"[CITATIONS] Total citations collected: {len(citations)}")
+        if citations:
+            for idx, citation in enumerate(citations, 1):
+                self.logger.debug(f"[CITATIONS] #{idx}: doc={citation.document_id}, chunk={citation.chunk_number}, score={citation.score}")
+
         # Log final metrics with rich formatting if available
         if RICH_AVAILABLE and _console:
             self._display_metrics_rich(metrics)
@@ -436,7 +482,8 @@ Response:"""
                 result=formatted_result,
                 metrics=metrics,
                 execution_history=execution_history,
-                completion_status=completion_status
+                completion_status=completion_status,
+                citations=citations
             )
         else:
             return formatted_result
@@ -472,11 +519,37 @@ Response:"""
             {"role": "user", "content": f"Original request: {original_request}\n\nResults:\n{combined}"}
         ]
 
-        response = await self.llm.chat.completions.create(
-            messages=messages,
-            **self._get_generation_kwargs()
-        )
-        response_text = response.choices[0].message.content
+        # Trace the LLM call for final response (legacy)
+        # Pass full messages array to capture system prompt + user input
+        async with self.telemetry.trace_llm_call(
+            prompt=messages,
+            model=self.model,
+            call_type="final_response_legacy",
+            llm_name="final_response_legacy"
+        ):
+            response = await self.llm.chat.completions.create(
+                messages=messages,
+                **self._get_generation_kwargs()
+            )
+            response_text = response.choices[0].message.content
+
+            # Extract usage if available
+            usage = None
+            if hasattr(response, "usage") and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+
+            # Update generation with output WHILE still inside the context
+            if hasattr(self.telemetry, "update_generation"):
+                self.telemetry.update_generation(
+                    output={"response": response_text},
+                    usage=usage,
+                )
+                self.logger.debug("[FINAL] Updated generation with final response (legacy)")
+
         self.logger.debug(f"[FINAL] Final response: {response_text}")
 
         # Track metrics
@@ -485,29 +558,58 @@ Response:"""
         return response_text
 
     @trace_method("agent.final_formatting")
-    async def _format_final_response_with_history(self, input_text: str, execution_history: List[Dict[str, Any]], completion_status: Dict[str, Any]) -> str:
+    async def _format_final_response_with_history(self, input_text: str, execution_history: List[Dict[str, Any]], completion_status: Dict[str, Any], citations: List[Citation] = None) -> str:
         """Format the final response using execution history and completion status.
 
         Args:
             input_text: The original user request
             execution_history: List of executed tasks with their results
             completion_status: Dictionary containing completion status and reasoning
+            citations: Optional list of citations to include in the response
 
         Returns:
-            Formatted final response
+            Formatted final response with inline citations and references
         """
         self.logger.debug(f"[FINAL-HISTORY] Formatting response for: {input_text}")
         self.logger.debug(f"[FINAL-HISTORY] Execution history: {len(execution_history)} items")
         self.logger.debug(f"[FINAL-HISTORY] Completion status: {completion_status}")
 
         # Extract results from execution history
+        # Be more lenient: accept any result that has content, regardless of status
         task_results = []
         for item in execution_history:
-            if item.get('status') == 'completed' and item.get('result'):
-                task_results.append(item['result'])
+            result = item.get('result')
+            status = item.get('status')
 
-        # If we have no successful results, use the completion status reasoning
+            # Include result if:
+            # 1. Status is 'completed' and result exists, OR
+            # 2. Result exists and is not an error message (even if status is 'failed')
+            if result and str(result).strip():
+                # Skip error messages
+                if not (status == 'failed' or str(result).startswith('Error:')):
+                    task_results.append(result)
+                    self.logger.debug(f"[FINAL-HISTORY] Including result from item with status={status}")
+                else:
+                    self.logger.debug(f"[FINAL-HISTORY] Skipping error result: {str(result)[:100]}")
+
+        self.logger.debug(f"[FINAL-HISTORY] Extracted {len(task_results)} task results from {len(execution_history)} history items")
+        for i, item in enumerate(execution_history):
+            self.logger.debug(f"[FINAL-HISTORY] History item {i}: status={item.get('status')}, has_result={bool(item.get('result'))}, result_preview={str(item.get('result'))[:100]}")
+
+        # If we have no successful results, try to extract ANY result content before giving up
         if not task_results:
+            self.logger.warning(f"[FINAL-HISTORY] No valid task results found in primary extraction")
+
+            # Fallback: try to get ANY result from execution history (even if status is not 'completed')
+            for item in execution_history:
+                result = item.get('result')
+                if result and str(result).strip() and not str(result).startswith('Error:'):
+                    task_results.append(result)
+                    self.logger.info(f"[FINAL-HISTORY] Fallback: including result from item with status={item.get('status')}")
+
+        # If we STILL have no results, use the completion status reasoning as a last resort
+        if not task_results:
+            self.logger.warning(f"[FINAL-HISTORY] No task results found after fallback, using completion status reasoning")
             if completion_status.get('reasoning'):
                 return completion_status['reasoning']
             else:
@@ -519,30 +621,80 @@ Response:"""
             for i, result in enumerate(task_results)
         ])
 
+        # Prepare citation information for the prompt
+        citations = citations or []
+        citation_info = ""
+        if citations:
+            self.logger.info(f"[FINAL-HISTORY] Formatting response with {len(citations)} citations")
+            citation_info = "\n\nAvailable citations (reference these in your response):\n"
+            for idx, citation in enumerate(citations, 1):
+                citation_info += f"[{idx}] document_id: {citation.document_id}, chunk_number: {citation.chunk_number}\n"
+                if citation.content_preview:
+                    citation_info += f"    Preview: {citation.content_preview[:100]}...\n"
+
         # Create a comprehensive final response using LLM
+        system_prompt = """You are an assistant that synthesizes information from multiple sources to provide comprehensive answers.
+Given the original question and findings from various tools/searches, create a coherent, well-structured response that:
+1. Directly answers the original question
+2. Integrates information from all findings
+3. Provides clear, factual information
+4. Is well-organized and easy to read"""
+
+        if citations:
+            system_prompt += """
+5. CRITICAL: Include inline citations in your response using square brackets [1], [2], etc. to reference the source citations provided below
+6. Place citation numbers immediately after the sentence or claim they support (you can reference multiple citations like [1, 2])
+7. At the end of your response, you MUST include a References section listing ALL citations used in the exact format:
+
+## References
+[1] Document: document_id, Chunk: chunk_number
+[2] Document: document_id, Chunk: chunk_number
+
+Replace 'document_id' and 'chunk_number' with the actual values from the citations list provided."""
+
         messages = [
-            {"role": "system", "content": """You are an assistant that synthesizes information from multiple sources to provide comprehensive answers. 
-            Given the original question and findings from various tools/searches, create a coherent, well-structured response that:
-            1. Directly answers the original question
-            2. Integrates information from all findings
-            3. Provides clear, factual information
-            4. Is well-organized and easy to read"""},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"""Original question: {input_text}
 
 Research findings:
-{combined_results}
+{combined_results}{citation_info}
 
 Please provide a comprehensive answer to the original question based on these findings."""}
         ]
 
         try:
-            response = await self.llm.chat.completions.create(
-                messages=messages,
-                **self._get_generation_kwargs()
-            )
-            response_text = response.choices[0].message.content
-            
-            # Track metrics
+            # Trace the LLM call for final response formatting
+            # Pass full messages array to capture system prompt + user input
+            async with self.telemetry.trace_llm_call(
+                prompt=messages,
+                model=self.model,
+                call_type="final_response",
+                llm_name="final_response"
+            ):
+                response = await self.llm.chat.completions.create(
+                    messages=messages,
+                    **self._get_generation_kwargs()
+                )
+                response_text = response.choices[0].message.content
+
+                # Extract usage if available
+                usage = None
+                if hasattr(response, 'usage') and response.usage:
+                    usage = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    }
+
+                # Update generation with output WHILE still inside the context
+                if hasattr(self.telemetry, 'update_generation'):
+                    self.telemetry.update_generation(
+                        output={"response": response_text},
+                        usage=usage
+                    )
+                    self.logger.debug(f"[FINAL-HISTORY] Updated generation with output")
+
+            # Track metrics (after context closes)
             self._update_token_usage(response)
 
             self.logger.debug(f"[FINAL-HISTORY] Generated response: {response_text[:200]}...")
@@ -585,7 +737,8 @@ Please provide a comprehensive answer to the original question based on these fi
                     pass
 
             # Trace the LLM call within the reasoning phase
-            async with self.telemetry.trace_llm_call(messages[1]["content"], self.model, "reasoning", llm_name=self.model):
+            # Pass full messages array to capture system prompt + user input
+            async with self.telemetry.trace_llm_call(messages, self.model, "reasoning", llm_name="reasoning"):
                 response = await self.llm.chat.completions.create(
                     messages=messages,
                     **gen_kwargs
@@ -774,7 +927,8 @@ Please provide a comprehensive answer to the original question based on these fi
         kwargs["temperature"] = min(0.3, kwargs.get("temperature", 0.7))
 
         # Trace the tool argument generation LLM call
-        async with self.telemetry.trace_llm_call(prompt, self.model, "tool_args", llm_name=self.model):
+        # Pass full messages array to capture system prompt + user prompt
+        async with self.telemetry.trace_llm_call(messages, self.model, "tool_args", llm_name="tool_args"):
             response = await self.llm.chat.completions.create(
                 messages=messages,
                 **kwargs
@@ -857,16 +1011,42 @@ Please provide a comprehensive answer to the original question based on these fi
 
         self.logger.debug(f"[ASYNC-RESPONSE] Generating response for: {task_description}")
 
-        response = await self.llm.chat.completions.create(
+        # Trace the LLM call for generate response
+        # Pass full messages array to capture system prompt + user input
+        async with self.telemetry.trace_llm_call(
+            prompt=messages,
             model=self.model,
-            messages=messages,
-            temperature=0.7
-        )
+            call_type="generate",
+            llm_name="generate_response"
+        ):
+            response = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.7
+            )
 
-        # Track metrics
+            response_text = response.choices[0].message.content
+
+            # Extract usage if available
+            usage = None
+            if hasattr(response, 'usage') and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
+
+            # Update generation with output WHILE still inside the context
+            if hasattr(self.telemetry, 'update_generation'):
+                self.telemetry.update_generation(
+                    output={"response": response_text},
+                    usage=usage
+                )
+                self.logger.debug(f"[ASYNC-RESPONSE] Updated generation with output")
+
+        # Track metrics (after context closes)
         self._update_token_usage(response)
 
-        response_text = response.choices[0].message.content
         self.logger.debug(f"[ASYNC-RESPONSE] Generated: {response_text}")
         return response_text
 
@@ -910,36 +1090,74 @@ Please provide a comprehensive answer to the original question based on these fi
 
         self.logger.debug(f"[ASYNC-COMPLETION] Checking completion for: {original_request}")
 
-        response = await self.llm.chat.completions.create(
+        # Trace the LLM call for completion check
+        # Pass full messages array to capture system prompt + user input
+        async with self.telemetry.trace_llm_call(
+            prompt=messages,
             model=self.model,
-            messages=messages,
-            temperature=0.7
-        )
+            call_type="completion_check",
+            llm_name="check_completion"
+        ):
+            response = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.7
+            )
 
-        # Track metrics
+            response_text = response.choices[0].message.content
+
+            # Extract usage if available
+            usage = None
+            if hasattr(response, 'usage') and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
+
+            try:
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    completion_status = json.loads(json_match.group())
+                else:
+                    completion_status = json.loads(response_text)
+
+                self.logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
+
+                # Update generation with parsed output WHILE still inside the context
+                if hasattr(self.telemetry, 'update_generation'):
+                    self.telemetry.update_generation(
+                        output=completion_status,
+                        usage=usage
+                    )
+                    self.logger.debug(f"[ASYNC-COMPLETION] Updated generation with parsed output")
+
+            except (json.JSONDecodeError, KeyError) as e:
+                self.logger.exception(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
+
+                # Update generation with error information WHILE still inside the context
+                if hasattr(self.telemetry, 'update_generation'):
+                    error_output = {
+                        "error": str(e),
+                        "failed_to_parse": response_text[:500]
+                    }
+                    self.telemetry.update_generation(output=error_output, usage=usage)
+                    self.logger.debug(f"[ASYNC-COMPLETION] Updated generation with error")
+
+                # Default to continuing if we can't parse
+                completion_status = {
+                    "is_complete": False,
+                    "reasoning": "Failed to parse completion check",
+                    "next_action": "Continue with next iteration",
+                    "missing_steps": []
+                }
+
+        # Track metrics (after context closes)
         if self.current_metrics:
             self.current_metrics.completion_checks += 1
         self._update_token_usage(response)
 
-        try:
-            response_text = response.choices[0].message.content
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                completion_status = json.loads(json_match.group())
-            else:
-                completion_status = json.loads(response_text)
-
-            self.logger.debug(f"[ASYNC-COMPLETION] Status: {completion_status}")
-            return completion_status
-        except (json.JSONDecodeError, KeyError) as e:
-            self.logger.exception(f"[ASYNC-COMPLETION] Error parsing completion status: {e}")
-            # Default to continuing if we can't parse
-            return {
-                "is_complete": False,
-                "reasoning": "Failed to parse completion check",
-                "next_action": "Continue with next iteration",
-                "missing_steps": []
-            }
+        return completion_status
 
     def _display_metrics_rich(self, metrics: AgentMetrics):
         """Display metrics using rich formatting.
@@ -994,5 +1212,3 @@ Please provide a comprehensive answer to the original question based on these fi
             panel_content += f"  {i}. {task['description']} [dim](Tool: {tool_name})[/dim]\n"
 
         _console.print(Panel(panel_content, title="🧠 Reasoning Phase", border_style="blue"))
-
-

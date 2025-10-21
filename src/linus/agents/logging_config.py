@@ -132,11 +132,11 @@ def log_with_table(data: list, title: str = "", console: Optional[Console] = Non
     console.print(table)
 
 
-def log_metrics(metrics: dict, title: str = "Metrics", console: Optional[Console] = None):
+def log_metrics(metrics, title: str = "Metrics", console: Optional[Console] = None):
     """Log metrics in a formatted table.
 
     Args:
-        metrics: Dictionary of metrics
+        metrics: Dictionary of metrics or AgentMetrics object
         title: Title for the metrics display
         console: Console instance (creates new if None)
     """
@@ -144,6 +144,10 @@ def log_metrics(metrics: dict, title: str = "Metrics", console: Optional[Console
 
     if console is None:
         console = Console()
+
+    # Convert AgentMetrics to dict if needed
+    if hasattr(metrics, 'to_dict'):
+        metrics = metrics.to_dict()
 
     table = Table(title=title, show_header=True, header_style="bold green")
     table.add_column("Metric", style="cyan", no_wrap=True)

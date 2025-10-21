@@ -293,7 +293,7 @@ class LangfuseTracer:
 
     def trace_llm_call(
         self,
-        prompt: str,
+        prompt,  # Can be str or List[Dict] (messages array)
         model: str,
         call_type: str = "completion",
         llm_name: Optional[str] = None
@@ -301,7 +301,7 @@ class LangfuseTracer:
         """Create a span for LLM call.
 
         Args:
-            prompt: Prompt sent to LLM
+            prompt: Prompt sent to LLM (string or messages array)
             model: Model name
             call_type: Type of call (reasoning, tool_args, generate)
             llm_name: Optional LLM name for hierarchical naming (e.g., "reasoning", "tool_args")
@@ -331,7 +331,7 @@ class LangfuseTracer:
                     as_type='generation',
                     name=generation_name,
                     model=model,
-                    input=prompt,
+                    input=prompt,  # Langfuse accepts both str and List[Dict]
                     metadata={"call_type": call_type, "llm_name": name}
                 ) as generation:
                     logger.debug(f"[LANGFUSE] Generation created: {type(generation)}")
@@ -693,7 +693,7 @@ class AgentTracer:
 
     def trace_llm_call(
         self,
-        prompt: str,
+        prompt,  # Can be str or List[Dict] (messages array)
         model: str,
         call_type: str = "completion",
         llm_name: Optional[str] = None
@@ -701,7 +701,7 @@ class AgentTracer:
         """Create a span for LLM call.
 
         Args:
-            prompt: Prompt sent to LLM
+            prompt: Prompt sent to LLM (string or messages array)
             model: Model name
             call_type: Type of call (reasoning, tool_args, generate)
             llm_name: Optional LLM name for hierarchical naming (e.g., "reasoning", "tool_args")
@@ -717,6 +717,10 @@ class AgentTracer:
         name = llm_name or call_type
         span_name = f"llm.{name}"
 
+        # Convert messages array to string for OpenTelemetry attributes
+        import json
+        prompt_str = json.dumps(prompt) if isinstance(prompt, list) else prompt
+
         # Wrap OpenTelemetry's sync context manager for async usage
         from contextlib import asynccontextmanager
 
@@ -728,7 +732,7 @@ class AgentTracer:
                 attributes={
                     "llm.model": model,
                     "llm.name": name,
-                    "llm.prompt": prompt,  # No truncation
+                    "llm.prompt": prompt_str,  # No truncation
                     "llm.call_type": call_type,
                 }
             ) as span:
