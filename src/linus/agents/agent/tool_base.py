@@ -1,8 +1,13 @@
 """Base tool classes - pure Python implementation without LangChain."""
 
-from typing import Optional, Type, Dict, Any, Callable
+import os
+import importlib
+import importlib.util
+from typing import Optional, Type, Dict, Any, Callable, List
 from pydantic import BaseModel
 from abc import ABC, abstractmethod
+from copy import deepcopy
+import json
 
 
 class BaseTool(ABC):
@@ -146,3 +151,198 @@ def tool(
             args_schema=args_schema
         )
     return decorator
+
+
+class ToolRegistry:
+    """Centralized tool registry for managing and organizing tools."""
+
+    def __init__(self):
+        self.tool_map: Dict[str, BaseTool] = {}  # Tool name -> Tool instance
+        self.tool_schemas: List[Dict[str, Any]] = []  # OpenAI format schemas
+
+    def register_tool(self, tool: BaseTool) -> bool:
+        """Register a single tool.
+
+        Args:
+            tool: BaseTool instance to register
+
+        Returns:
+            True if registration successful, False otherwise
+        """
+        if not isinstance(tool, BaseTool):
+            return False
+
+        tool_name = tool.name
+        self.tool_map[tool_name] = tool
+
+        # Build OpenAI-compatible schema
+        schema = self._build_openai_schema(tool)
+        self.tool_schemas.append(schema)
+        return True
+
+    def register_tools(self, tools: List[BaseTool]) -> bool:
+        """Batch register multiple tools.
+
+        Args:
+            tools: List of BaseTool instances
+
+        Returns:
+            True if all registrations successful, False otherwise
+        """
+        success = True
+        for tool in tools:
+            if not self.register_tool(tool):
+                success = False
+        return success
+
+    def get_tool(self, tool_name: str) -> Optional[BaseTool]:
+        """Get a tool by name.
+
+        Args:
+            tool_name: Name of the tool
+
+        Returns:
+            BaseTool instance or None if not found
+        """
+        return self.tool_map.get(tool_name)
+
+    def get_tools(self) -> List[Dict[str, Any]]:
+        """Get all tool schemas in OpenAI format.
+
+        Returns:
+            List of tool schemas
+        """
+        return deepcopy(self.tool_schemas)
+
+    def get_tools_str(self) -> str:
+        """Convert tool schemas to formatted JSON string.
+
+        Returns:
+            JSON string of tool schemas
+        """
+        return json.dumps(self.tool_schemas, indent=4, ensure_ascii=False)
+
+    def _build_openai_schema(self, tool: BaseTool) -> Dict[str, Any]:
+        """Build OpenAI-compatible tool schema.
+
+        Args:
+            tool: BaseTool instance
+
+        Returns:
+            OpenAI format tool schema
+        """
+        schema = {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }
+
+        # Extract schema from Pydantic model if available
+        if tool.args_schema:
+            json_schema = tool.args_schema.model_json_schema()
+            properties = json_schema.get("properties", {})
+            required = json_schema.get("required", [])
+
+            schema["function"]["parameters"]["properties"] = properties
+            schema["function"]["parameters"]["required"] = required
+
+        return schema
+
+
+class ToolLoader:
+    """Dynamic tool loader supporting file-based tool loading."""
+
+    def __init__(self, tools_directory: str = "tools"):
+        """Initialize tool loader.
+
+        Args:
+            tools_directory: Directory containing tool Python files
+        """
+        self.tools_directory = tools_directory
+        self.loaded_tools: Dict[str, BaseTool] = {}
+
+    def load_tool(self, tool_name: str) -> BaseTool:
+        """Load a single tool from file.
+
+        Args:
+            tool_name: Name of the tool (filename without .py)
+
+        Returns:
+            BaseTool instance
+
+        Raises:
+            FileNotFoundError: If tool file doesn't exist
+            AttributeError: If tool is not properly defined
+        """
+        # Return cached tool if already loaded
+        if tool_name in self.loaded_tools:
+            return self.loaded_tools[tool_name]
+
+        # Construct file path
+        tool_path = os.path.join(self.tools_directory, f"{tool_name}.py")
+        if not os.path.exists(tool_path):
+            raise FileNotFoundError(f"Tool '{tool_name}' not found at {tool_path}")
+
+        # Dynamic module loading
+        spec = importlib.util.spec_from_file_location(tool_name, tool_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # Try to find the tool in the module
+        # Convention: look for a class ending with 'Tool' or matching tool_name
+        tool_instance = None
+
+        # First, try to find a class matching tool_name (case-insensitive)
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if isinstance(attr, type) and issubclass(attr, BaseTool) and attr is not BaseTool:
+                # Instantiate the tool class
+                tool_instance = attr()
+                break
+
+        if tool_instance is None:
+            raise AttributeError(
+                f"No BaseTool subclass found in {tool_path}. "
+                f"Ensure the file contains a class inheriting from BaseTool."
+            )
+
+        # Cache the loaded tool
+        self.loaded_tools[tool_name] = tool_instance
+        return tool_instance
+
+    def load_tools(self, tool_names: List[str]) -> Dict[str, BaseTool]:
+        """Batch load multiple tools.
+
+        Args:
+            tool_names: List of tool names to load
+
+        Returns:
+            Dictionary mapping tool names to BaseTool instances
+        """
+        for tool_name in tool_names:
+            if tool_name not in self.loaded_tools:
+                self.load_tool(tool_name)
+        return self.loaded_tools
+
+    def discover_tools(self) -> List[str]:
+        """Discover all available tools in the tools directory.
+
+        Returns:
+            List of discovered tool names
+        """
+        if not os.path.exists(self.tools_directory):
+            return []
+
+        tool_names = []
+        for filename in os.listdir(self.tools_directory):
+            if filename.endswith('.py') and not filename.startswith('_'):
+                tool_name = filename[:-3]  # Remove .py extension
+                tool_names.append(tool_name)
+        return tool_names

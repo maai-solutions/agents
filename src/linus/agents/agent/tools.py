@@ -1,12 +1,12 @@
 """Example tools for the ReasoningAgent."""
 
-from typing import Optional, Type, Any
+from typing import Optional, Type, Any, List, Union
 from pydantic import BaseModel, Field
 import subprocess
 import requests
 import json
 
-from .tool_base import BaseTool, StructuredTool, tool
+from .tool_base import BaseTool, StructuredTool, tool, ToolRegistry, ToolLoader
 
 
 class SearchInput(BaseModel):
@@ -181,13 +181,13 @@ def create_custom_tool(
     args_schema: Optional[Type[BaseModel]] = None
 ) -> StructuredTool:
     """Create a custom tool from a function.
-    
+
     Args:
         name: Tool name
         description: Tool description
         func: The function to wrap
         args_schema: Optional Pydantic model for arguments
-        
+
     Returns:
         A StructuredTool instance
     """
@@ -197,3 +197,88 @@ def create_custom_tool(
         description=description,
         args_schema=args_schema
     )
+
+
+def load_tools_from_directory(
+    tools_directory: str = "tools",
+    tool_names: Optional[List[str]] = None
+) -> List[BaseTool]:
+    """Load tools from a directory.
+
+    This function dynamically loads tools from Python files in the specified directory.
+    Each tool file should contain a class that inherits from BaseTool.
+
+    Args:
+        tools_directory: Path to the directory containing tool files
+        tool_names: Optional list of specific tool names to load.
+                   If None, discovers and loads all tools in the directory.
+
+    Returns:
+        List of loaded BaseTool instances
+
+    Example:
+        # Load all tools from 'custom_tools' directory
+        tools = load_tools_from_directory("custom_tools")
+
+        # Load specific tools
+        tools = load_tools_from_directory("custom_tools", ["weather", "calculator"])
+    """
+    loader = ToolLoader(tools_directory)
+
+    # Discover tools if no specific names provided
+    if tool_names is None:
+        tool_names = loader.discover_tools()
+
+    # Load the tools
+    loaded_tools_dict = loader.load_tools(tool_names)
+
+    # Return as list
+    return list(loaded_tools_dict.values())
+
+
+def create_tool_registry(
+    tools: Optional[List[Union[BaseTool, str]]] = None,
+    tools_directory: str = "tools"
+) -> ToolRegistry:
+    """Create a tool registry with optional tools.
+
+    This function creates a ToolRegistry and optionally populates it with tools.
+    Tools can be provided as BaseTool instances or as strings (tool names to load).
+
+    Args:
+        tools: Optional list of tools. Can be BaseTool instances or strings (tool names)
+        tools_directory: Directory to load tools from when tool names are provided as strings
+
+    Returns:
+        Configured ToolRegistry instance
+
+    Example:
+        # Create empty registry
+        registry = create_tool_registry()
+
+        # Create registry with pre-defined tools
+        registry = create_tool_registry([SearchTool(), CalculatorTool()])
+
+        # Create registry with tools loaded from files
+        registry = create_tool_registry(["weather", "calculator"], "custom_tools")
+
+        # Mix of pre-defined and file-based tools
+        registry = create_tool_registry([SearchTool(), "weather"], "custom_tools")
+    """
+    registry = ToolRegistry()
+
+    if tools:
+        loader = ToolLoader(tools_directory)
+
+        for tool in tools:
+            if isinstance(tool, str):
+                # Load tool from file
+                tool_instance = loader.load_tool(tool)
+                registry.register_tool(tool_instance)
+            elif isinstance(tool, BaseTool):
+                # Register pre-defined tool
+                registry.register_tool(tool)
+            else:
+                raise TypeError(f"Tool must be BaseTool instance or string, got {type(tool)}")
+
+    return registry

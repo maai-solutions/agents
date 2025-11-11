@@ -17,8 +17,17 @@ from .reasoning_agent import ReasoningAgent
 # CoordinatorAgent implementation
 from .coordinator_agent import CoordinatorAgent, SubAgent
 
+# TreeOfThoughtAgent implementation
+from .tot import TreeOfThoughtAgent
+
+# LightAgent implementation
+from .light_agent import LightAgent
+
+# Swarm implementation
+from .swarm import Swarm
+
 # Factory functions
-from .factory import Agent
+from .factory import Agent, TreeOfThought, Coordinator, Light
 
 # Tool base classes
 from .tool_base import BaseTool, StructuredTool, tool
@@ -58,8 +67,14 @@ __all__ = [
     "ReasoningAgent",
     "CoordinatorAgent",
     "SubAgent",
-    # Factory
+    "TreeOfThoughtAgent",
+    "LightAgent",
+    "Swarm",
+    # Factory functions
     "Agent",
+    "TreeOfThought",
+    "Coordinator",
+    "Light",
     # Tool base classes
     "BaseTool",
     "StructuredTool",
