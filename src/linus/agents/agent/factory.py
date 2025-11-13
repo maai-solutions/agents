@@ -11,6 +11,7 @@ from .tot import TreeOfThoughtAgent
 from .light_agent import LightAgent
 from .swarm import Swarm
 from .tool_base import BaseTool
+from .config import AgentParams, LLMConfig, MemoryConfig, StateConfig
 from ..graph.state import SharedState
 
 # Import memory components
@@ -24,13 +25,7 @@ except ImportError:
 
 # Example usage function
 def Agent(
-    api_base: str = "http://localhost:11434/v1",  # Ollama OpenAI-compatible endpoint
-    model: str = "gemma3:27b",
-    api_key: str = "not-needed",
-    temperature: float = 0.7,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
+    params: Optional[AgentParams] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
     input_schema: Optional[Type[BaseModel]] = None,
@@ -38,12 +33,8 @@ def Agent(
     output_key: Optional[str] = None,
     state: Optional[SharedState] = None,
     max_iterations: int = 10,
-    enable_memory: bool = False,
-    memory_backend: str = "in_memory",
-    max_context_tokens: int = 4096,
     memory_context_ratio: float = 0.3,
-    max_memory_size: Optional[int] = 100,
-    use_async: bool = False,
+    use_async: bool = True,
     use_json_format: bool = False,
     tracer: Optional[Any] = None,
     session_id: Optional[str] = None,
@@ -52,13 +43,7 @@ def Agent(
     """Create a ReasoningAgent configured for Gemma3:27b or other OpenAI-compatible models.
 
     Args:
-        api_base: The OpenAI-compatible API endpoint (e.g., "http://localhost:11434/v1" for Ollama)
-        model: The model name (e.g., "gemma3:27b" for Ollama, "gpt-4" for OpenAI)
-        api_key: API key for authentication (default: "not-needed" for Ollama, required for OpenAI)
-        temperature: Sampling temperature (0.0 to 2.0). Higher = more random (default: 0.7)
-        max_tokens: Maximum tokens to generate in completion (default: None = model default)
-        top_p: Nucleus sampling parameter (0.0 to 1.0). Alternative to temperature (default: None)
-        top_k: Top-k sampling parameter. Only available on some models like Ollama (default: None)
+        params: AgentParams configuration object (if not provided, uses defaults)
         tools: List of tools available to the agent
         verbose: Whether to enable verbose logging
         input_schema: Optional Pydantic BaseModel for structured input validation
@@ -66,51 +51,54 @@ def Agent(
         output_key: Optional key to save output in shared state
         state: Optional SharedState instance for state management
         max_iterations: Maximum number of reasoning-execution loops (default: 10)
-        enable_memory: Whether to enable memory management
-        memory_backend: Type of memory backend ("in_memory" or "vector_store")
-        max_context_tokens: Maximum tokens for context window (for memory management, not generation)
         memory_context_ratio: Ratio of context to use for memory (0.0 to 1.0)
-        max_memory_size: Maximum number of memories to keep (None for unlimited)
-        use_async: Whether to use AsyncOpenAI client (default: False for OpenAI client)
-        use_json_format: Whether to use response_format={"type": "json_object"} (default: False, not all models support this)
+        use_async: Whether to use AsyncOpenAI client (default: True)
+        use_json_format: Whether to use response_format={"type": "json_object"} (default: False)
         tracer: Optional telemetry tracer (AgentTracer or LangfuseTracer)
         session_id: Optional session ID for Langfuse session grouping
-        agent_name: Optional name for the agent (used in hierarchical tracing like agent.<name>)
+        agent_name: Optional name for the agent (used in hierarchical tracing)
 
     Returns:
         Configured ReasoningAgent instance
 
     Examples:
-        # For Ollama (local):
-        agent = Agent(
-            api_base="http://localhost:11434/v1",
-            model="gemma3:27b",
-            api_key="not-needed",
+        # Using AgentParams (recommended):
+        from linus.agents.agent.config import AgentParams, LLMConfig, MemoryConfig
+
+        params = AgentParams(
+            llm_config=LLMConfig(
+                api_base="http://localhost:11434/v1",
+                model="gemma3:27b",
+                api_key="not-needed"
+            ),
             temperature=0.7,
             max_tokens=2048,
-            top_k=40
+            top_k=40,
+            memory_config=MemoryConfig(
+                enable_memory=True,
+                memory_backend="in_memory",
+                max_memory_size=100
+            )
         )
+        agent = Agent(params=params, tools=get_default_tools())
 
-        # For OpenAI:
-        agent = Agent(
-            api_base="https://api.openai.com/v1",
-            model="gpt-4",
-            api_key="sk-...",
-            temperature=0.5,
-            max_tokens=1000,
-            top_p=0.9
-        )
+        # Using defaults (Ollama):
+        agent = Agent(tools=get_default_tools())
     """
-    # Configure OpenAI client for Gemma through OpenAI-compatible API
+    # Use default params if not provided
+    if params is None:
+        params = AgentParams()
+
+    # Configure OpenAI client
     if use_async:
         llm = AsyncOpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
     else:
         llm = OpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
 
     if tools is None:
@@ -118,22 +106,22 @@ def Agent(
 
     # Create memory manager if enabled
     memory_manager = None
-    if enable_memory and MEMORY_AVAILABLE:
+    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
         memory_manager = create_memory_manager(
-            backend_type=memory_backend,
-            max_context_tokens=max_context_tokens,
-            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            backend_type=params.memory_config.memory_backend,
+            max_context_tokens=params.memory_config.max_context_tokens,
+            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
             llm=llm,
-            model=model,
-            max_size=max_memory_size
+            model=params.llm_config.model,
+            max_size=params.memory_config.max_memory_size
         )
-        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend with OpenAI client")
-    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend with OpenAI client")
+    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
     agent = ReasoningAgent(
         llm=llm,
-        model=model,
+        model=params.llm_config.model,
         tools=tools,
         verbose=verbose,
         input_schema=input_schema,
@@ -143,11 +131,11 @@ def Agent(
         max_iterations=max_iterations,
         memory_manager=memory_manager,
         memory_context_ratio=memory_context_ratio,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        top_k=top_k,
-        api_base=api_base,
+        temperature=params.temperature,
+        max_tokens=params.max_tokens,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        api_base=params.llm_config.api_base,
         use_json_format=use_json_format,
         agent_name=agent_name
     )
@@ -167,13 +155,7 @@ def Agent(
 
 
 def Coordinator(
-    api_base: str = "http://localhost:11434/v1",
-    model: str = "gemma3:27b",
-    api_key: str = "not-needed",
-    temperature: float = 0.7,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
+    params: Optional[AgentParams] = None,
     subagents: Optional[List[SubAgent]] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
@@ -182,11 +164,7 @@ def Coordinator(
     output_key: Optional[str] = None,
     state: Optional[SharedState] = None,
     max_iterations: int = 15,
-    enable_memory: bool = False,
-    memory_backend: str = "in_memory",
-    max_context_tokens: int = 4096,
     memory_context_ratio: float = 0.3,
-    max_memory_size: Optional[int] = 100,
     use_async: bool = True,
     use_json_format: bool = False,
     tracer: Optional[Any] = None,
@@ -196,13 +174,7 @@ def Coordinator(
     """Create a CoordinatorAgent that orchestrates multiple subagents.
 
     Args:
-        api_base: The OpenAI-compatible API endpoint
-        model: The model name (e.g., "gemma3:27b", "gpt-4")
-        api_key: API key for authentication
-        temperature: Sampling temperature (0.0 to 2.0)
-        max_tokens: Maximum tokens to generate
-        top_p: Nucleus sampling parameter
-        top_k: Top-k sampling parameter
+        params: AgentParams configuration object (if not provided, uses defaults)
         subagents: List of SubAgent instances to coordinate
         tools: Optional list of tools for the coordinator (not subagents)
         verbose: Whether to enable verbose logging
@@ -211,11 +183,7 @@ def Coordinator(
         output_key: Optional key to save output in shared state
         state: Optional SharedState instance
         max_iterations: Maximum number of plan-execute-evaluate loops (default: 15)
-        enable_memory: Whether to enable memory management
-        memory_backend: Type of memory backend
-        max_context_tokens: Maximum tokens for context window
         memory_context_ratio: Ratio of context to use for memory
-        max_memory_size: Maximum number of memories to keep
         use_async: Whether to use AsyncOpenAI client (default: True)
         use_json_format: Whether to use JSON response format
         tracer: Optional telemetry tracer
@@ -226,9 +194,17 @@ def Coordinator(
         Configured CoordinatorAgent instance
 
     Examples:
+        # Using AgentParams:
+        from linus.agents.agent.config import AgentParams, LLMConfig
+
+        params = AgentParams(
+            llm_config=LLMConfig(model="gemma3:27b"),
+            temperature=0.7
+        )
+
         # Create specialized subagents
-        research_agent = Agent(model="gemma3:27b", tools=[SearchTool()])
-        calc_agent = Agent(model="gemma3:27b", tools=[CalculatorTool()])
+        research_agent = Agent(tools=[SearchTool()])
+        calc_agent = Agent(tools=[CalculatorTool()])
 
         # Wrap them as SubAgents
         subagents = [
@@ -248,21 +224,25 @@ def Coordinator(
 
         # Create coordinator
         coordinator = Coordinator(
-            model="gemma3:27b",
+            params=params,
             subagents=subagents,
             verbose=True
         )
     """
+    # Use default params if not provided
+    if params is None:
+        params = AgentParams()
+
     # Configure OpenAI client
     if use_async:
         llm = AsyncOpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
     else:
         llm = OpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
 
     if subagents is None:
@@ -274,22 +254,22 @@ def Coordinator(
 
     # Create memory manager if enabled
     memory_manager = None
-    if enable_memory and MEMORY_AVAILABLE:
+    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
         memory_manager = create_memory_manager(
-            backend_type=memory_backend,
-            max_context_tokens=max_context_tokens,
-            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            backend_type=params.memory_config.memory_backend,
+            max_context_tokens=params.memory_config.max_context_tokens,
+            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
             llm=llm,
-            model=model,
-            max_size=max_memory_size
+            model=params.llm_config.model,
+            max_size=params.memory_config.max_memory_size
         )
-        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend")
-    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend")
+    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
     coordinator = CoordinatorAgent(
         llm=llm,
-        model=model,
+        model=params.llm_config.model,
         subagents=subagents,
         tools=tools,
         verbose=verbose,
@@ -300,11 +280,11 @@ def Coordinator(
         max_iterations=max_iterations,
         memory_manager=memory_manager,
         memory_context_ratio=memory_context_ratio,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        top_k=top_k,
-        api_base=api_base,
+        temperature=params.temperature,
+        max_tokens=params.max_tokens,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        api_base=params.llm_config.api_base,
         use_json_format=use_json_format,
         agent_name=agent_name
     )
@@ -323,13 +303,7 @@ def Coordinator(
 
 
 def TreeOfThought(
-    api_base: str = "http://localhost:11434/v1",
-    model: str = "gemma3:27b",
-    api_key: str = "not-needed",
-    temperature: float = 0.7,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
+    params: Optional[AgentParams] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
     input_schema: Optional[Type[BaseModel]] = None,
@@ -337,11 +311,6 @@ def TreeOfThought(
     output_key: Optional[str] = None,
     state: Optional[SharedState] = None,
     max_iterations: int = 10,
-    enable_memory: bool = False,
-    memory_backend: str = "in_memory",
-    max_context_tokens: int = 4096,
-    memory_context_ratio: float = 0.3,
-    max_memory_size: Optional[int] = 100,
     # ToT-specific parameters
     reasoning_model: Optional[str] = None,
     reasoning_api_base: Optional[str] = None,
@@ -364,13 +333,7 @@ def TreeOfThought(
     4. Execution with the refined plan
 
     Args:
-        api_base: The OpenAI-compatible API endpoint for execution
-        model: The model name for execution (e.g., "gemma3:27b", "gpt-4")
-        api_key: API key for authentication
-        temperature: Sampling temperature for execution (0.0 to 2.0)
-        max_tokens: Maximum tokens to generate in completion
-        top_p: Nucleus sampling parameter
-        top_k: Top-k sampling parameter (Ollama-specific)
+        params: AgentParams configuration object (if not provided, uses defaults)
         tools: List of tools available to the agent
         verbose: Whether to enable verbose logging
         input_schema: Optional Pydantic BaseModel for input validation
@@ -378,11 +341,6 @@ def TreeOfThought(
         output_key: Optional key to save output in shared state
         state: Optional SharedState instance for state management
         max_iterations: Maximum number of execution iterations
-        enable_memory: Whether to enable memory management
-        memory_backend: Type of memory backend
-        max_context_tokens: Maximum tokens for context window
-        memory_context_ratio: Ratio of context to use for memory
-        max_memory_size: Maximum number of memories to keep
         reasoning_model: Model name for reasoning phase (defaults to main model)
         reasoning_api_base: API base for reasoning model (defaults to main api_base)
         reasoning_api_key: API key for reasoning model (defaults to main api_key)
@@ -399,10 +357,17 @@ def TreeOfThought(
         Configured TreeOfThoughtAgent instance
 
     Examples:
+        # Using AgentParams
+        from linus.agents.agent.config import AgentParams, LLMConfig
+
+        params = AgentParams(
+            llm_config=LLMConfig(model="gemma3:27b"),
+            temperature=0.5
+        )
+
         # Basic ToT agent with Ollama
         tot_agent = TreeOfThought(
-            api_base="http://localhost:11434/v1",
-            model="gemma3:27b",
+            params=params,
             reasoning_model="deepseek-r1",  # Use DeepSeek-R1 for reasoning
             tools=[SearchTool(), CalculatorTool()],
             enable_reflection=True,
@@ -411,34 +376,35 @@ def TreeOfThought(
 
         # ToT agent with separate reasoning model
         tot_agent = TreeOfThought(
-            api_base="http://localhost:11434/v1",
-            model="gemma3:27b",
             reasoning_model="qwen2.5:32b",
             reasoning_temperature=0.9,  # Higher creativity for planning
-            temperature=0.5,  # Lower temperature for execution
             enable_reflection=True
         )
 
         # Run the agent
         result = await tot_agent.run("Analyze the market trends and calculate ROI")
     """
+    # Use default params if not provided
+    if params is None:
+        params = AgentParams()
+
     # Configure execution LLM
     if use_async:
         llm = AsyncOpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
     else:
         llm = OpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
 
     # Configure reasoning LLM (may be different from execution LLM)
     reasoning_llm = None
     if reasoning_model or reasoning_api_base or reasoning_api_key:
-        reasoning_base = reasoning_api_base or api_base
-        reasoning_key = reasoning_api_key or api_key
+        reasoning_base = reasoning_api_base or params.llm_config.api_base
+        reasoning_key = reasoning_api_key or params.llm_config.api_key
 
         if use_async:
             reasoning_llm = AsyncOpenAI(
@@ -456,22 +422,22 @@ def TreeOfThought(
 
     # Create memory manager if enabled
     memory_manager = None
-    if enable_memory and MEMORY_AVAILABLE:
+    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
         memory_manager = create_memory_manager(
-            backend_type=memory_backend,
-            max_context_tokens=max_context_tokens,
-            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            backend_type=params.memory_config.memory_backend,
+            max_context_tokens=params.memory_config.max_context_tokens,
+            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
             llm=llm,
-            model=model,
-            max_size=max_memory_size
+            model=params.llm_config.model,
+            max_size=params.memory_config.max_memory_size
         )
-        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend for ToT agent")
-    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend for ToT agent")
+    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
     agent = TreeOfThoughtAgent(
         llm=llm,
-        model=model,
+        model=params.llm_config.model,
         tools=tools,
         verbose=verbose,
         input_schema=input_schema,
@@ -480,15 +446,15 @@ def TreeOfThought(
         state=state,
         max_iterations=max_iterations,
         memory_manager=memory_manager,
-        reasoning_model=reasoning_model or model,
+        reasoning_model=reasoning_model or params.llm_config.model,
         reasoning_llm=reasoning_llm,
         enable_tool_filtering=enable_tool_filtering,
         enable_reflection=enable_reflection,
         max_reflection_depth=max_reflection_depth,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        top_k=top_k,
+        temperature=params.temperature,
+        max_tokens=params.max_tokens,
+        top_p=params.top_p,
+        top_k=params.top_k,
         reasoning_temperature=reasoning_temperature,
         agent_name=agent_name
     )
@@ -507,23 +473,13 @@ def TreeOfThought(
 
 
 def Light(
-    api_base: str = "http://localhost:11434/v1",
-    model: str = "gemma3:27b",
-    api_key: str = "not-needed",
-    temperature: float = 0.7,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
+    params: Optional[AgentParams] = None,
     tools: Optional[List[BaseTool]] = None,
     verbose: bool = True,
     input_schema: Optional[Type[BaseModel]] = None,
     output_schema: Optional[Type[BaseModel]] = None,
     output_key: Optional[str] = None,
     state: Optional[SharedState] = None,
-    enable_memory: bool = False,
-    memory_backend: str = "in_memory",
-    max_context_tokens: int = 4096,
-    max_memory_size: Optional[int] = 100,
     # LightAgent-specific parameters
     instructions: str = "You are a helpful AI assistant.",
     role: Optional[str] = None,
@@ -544,23 +500,13 @@ def Light(
     - Multi-agent swarms
 
     Args:
-        api_base: The OpenAI-compatible API endpoint
-        model: The model name (e.g., "gpt-4", "gemma3:27b")
-        api_key: API key for authentication
-        temperature: Sampling temperature (0.0 to 2.0)
-        max_tokens: Maximum tokens to generate
-        top_p: Nucleus sampling parameter
-        top_k: Top-k sampling parameter (Ollama-specific)
+        params: AgentParams configuration object (if not provided, uses defaults)
         tools: List of tools available to the agent
         verbose: Whether to enable verbose logging
         input_schema: Optional Pydantic BaseModel for input validation
         output_schema: Optional Pydantic BaseModel for output
         output_key: Optional key to save output in shared state
         state: Optional SharedState instance
-        enable_memory: Whether to enable memory management
-        memory_backend: Type of memory backend
-        max_context_tokens: Maximum tokens for context window
-        max_memory_size: Maximum number of memories to keep
         instructions: System instructions for the agent
         role: Optional role description
         max_tool_iterations: Maximum tool calling iterations (default: 10)
@@ -574,30 +520,35 @@ def Light(
         Configured LightAgent instance
 
     Examples:
+        # Using AgentParams
+        from linus.agents.agent.config import AgentParams, LLMConfig
+
+        params = AgentParams(
+            llm_config=LLMConfig(model="gpt-4"),
+            temperature=0.7
+        )
+
         # Basic LightAgent
         agent = Light(
-            model="gpt-4",
+            params=params,
             instructions="You are a helpful research assistant.",
             tools=[SearchTool(), CalculatorTool()]
         )
 
-        # With streaming
+        # With streaming (using defaults)
         agent = Light(
-            model="gemma3:27b",
             stream=True,
             instructions="You are a coding assistant."
         )
 
         # In a swarm
         researcher = Light(
-            model="gemma3:27b",
             instructions="You are a research specialist.",
             tools=[SearchTool()],
             agent_name="researcher"
         )
 
         calculator = Light(
-            model="gemma3:27b",
             instructions="You are a math specialist.",
             tools=[CalculatorTool()],
             agent_name="calculator"
@@ -609,16 +560,20 @@ def Light(
 
         result = await swarm.run("Calculate 42 * 17")
     """
+    # Use default params if not provided
+    if params is None:
+        params = AgentParams()
+
     # Configure OpenAI client
     if use_async:
         llm = AsyncOpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
     else:
         llm = OpenAI(
-            base_url=api_base,
-            api_key=api_key
+            base_url=params.llm_config.api_base,
+            api_key=params.llm_config.api_key
         )
 
     if tools is None:
@@ -626,22 +581,22 @@ def Light(
 
     # Create memory manager if enabled
     memory_manager = None
-    if enable_memory and MEMORY_AVAILABLE:
+    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
         memory_manager = create_memory_manager(
-            backend_type=memory_backend,
-            max_context_tokens=max_context_tokens,
-            summary_threshold_tokens=int(max_context_tokens * 0.5),
+            backend_type=params.memory_config.memory_backend,
+            max_context_tokens=params.memory_config.max_context_tokens,
+            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
             llm=llm,
-            model=model,
-            max_size=max_memory_size
+            model=params.llm_config.model,
+            max_size=params.memory_config.max_memory_size
         )
-        logger.info(f"[MEMORY] Initialized {memory_backend} memory backend for LightAgent")
-    elif enable_memory and not MEMORY_AVAILABLE:
+        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend for LightAgent")
+    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
         logger.warning("[MEMORY] Memory requested but module not available")
 
     agent = LightAgent(
         llm=llm,
-        model=model,
+        model=params.llm_config.model,
         tools=tools,
         verbose=verbose,
         input_schema=input_schema,
@@ -652,10 +607,10 @@ def Light(
         instructions=instructions,
         role=role,
         max_tool_iterations=max_tool_iterations,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        top_k=top_k,
+        temperature=params.temperature,
+        max_tokens=params.max_tokens,
+        top_p=params.top_p,
+        top_k=params.top_k,
         stream=stream,
         agent_name=agent_name
     )
