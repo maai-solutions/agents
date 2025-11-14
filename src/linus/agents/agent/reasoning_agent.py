@@ -8,9 +8,7 @@ import asyncio
 from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI
 
-from linus.agents.agent.memory import MemoryManager
-
-from .base import Agent
+from .base import Agent, ToolCallingMode
 from .models import ReasoningResult, TaskExecution, AgentMetrics, AgentResponse, Citation
 from .tool_base import BaseTool
 from .config import AgentParams, MemoryConfig, LLMConfig
@@ -49,7 +47,7 @@ class ReasoningAgent(Agent):
         output_key: Optional[str] = None,
         state: Optional[SharedState] = None,
         max_iterations: int = 10,
-        memory_manager: Optional[MemoryManager] = None,
+        memory: Optional[SharedState] = None,
         memory_context_ratio: float = 0.3,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
@@ -57,6 +55,7 @@ class ReasoningAgent(Agent):
         top_k: Optional[int] = None,
         api_base: Optional[str] = None,
         use_json_format: bool = False,
+        tool_calling_mode: Union[str, Any] = "auto",
         logger: Optional[ILogger] = None,
         telemetry: Optional[ITelemetry] = None,
         agent_name: Optional[str] = None,
@@ -73,7 +72,7 @@ class ReasoningAgent(Agent):
             output_key: Optional key to save output in shared state
             state: Optional SharedState instance for state management
             max_iterations: Maximum number of reasoning-execution loops before stopping
-            memory_manager: Optional memory manager for context persistence
+            memory: Optional SharedState with ConversationMemoryBackend for conversation history
             memory_context_ratio: Ratio of context window to use for memory (0.0 to 1.0)
             temperature: Sampling temperature for LLM calls (deprecated, use agent_params)
             max_tokens: Maximum tokens to generate in completion (deprecated, use agent_params)
@@ -81,11 +80,12 @@ class ReasoningAgent(Agent):
             top_k: Top-k sampling parameter (deprecated, use agent_params)
             api_base: Optional API base URL for reference (deprecated, use agent_params.llm_config)
             use_json_format: Whether to use response_format={"type": "json_object"} (not all models support this)
+            tool_calling_mode: Tool calling mode - "auto" (default), "native", or "manual"
             logger: Optional logger instance (uses DI container if None)
             telemetry: Optional telemetry instance (uses DI container if None)
             agent_name: Optional name for the agent (used in hierarchical tracing)
         """
-        super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory_manager, logger, telemetry, agent_name)
+        super().__init__(llm, model, tools, verbose, input_schema, output_schema, output_key, state, memory, tool_calling_mode, logger, telemetry, agent_name)
         self.reasoning_prompt = self._create_reasoning_prompt()
         self.execution_prompt = self._create_execution_prompt()
         self.completion_check_prompt = self._create_completion_check_prompt()
@@ -249,12 +249,11 @@ Response:"""
         self.logger.info(f"[RUN] Starting task: {input_text}")
 
         # Store user input in memory
-        if self.memory_manager:
-            self.memory_manager.add_memory(
+        if self.memory:
+            self.add_memory(
                 content=f"User: {input_text}",
-                metadata={"role": "user", "type": "input"},
-                importance=1.0,
-                entry_type="interaction"
+                source="user",
+                metadata={"role": "user", "type": "input", "importance": 1.0}
             )
 
         # Track execution history for all iterations
@@ -277,11 +276,10 @@ Response:"""
             context = input_text
 
             # Add memory context if available
-            if self.memory_manager:
-                memory_tokens = int(self.memory_manager.max_context_tokens * self.memory_context_ratio)
-                memory_context = self.memory_manager.get_context(
+            if self.memory and self.memory.max_context_tokens:
+                memory_tokens = int(self.memory.max_context_tokens * self.memory_context_ratio)
+                memory_context = self.get_memory_context(
                     max_tokens=memory_tokens,
-                    include_summary=True,
                     query=input_text
                 )
                 if memory_context:
@@ -428,21 +426,21 @@ Response:"""
         formatted_result = self._format_output(final_result)
 
         # Store agent response in memory
-        if self.memory_manager:
-            self.memory_manager.add_memory(
+        if self.memory:
+            self.add_memory(
                 content=f"Assistant: {str(formatted_result)[:500]}",  # Limit length
+                source="assistant",
                 metadata={
                     "role": "assistant",
                     "type": "output",
                     "iterations": iteration,
-                    "completed": is_complete
-                },
-                importance=1.0,
-                entry_type="interaction"
+                    "completed": is_complete,
+                    "importance": 1.0
+                }
             )
 
             # Log memory stats
-            mem_stats = self.memory_manager.get_memory_stats()
+            mem_stats = self.get_memory_stats()
             self.logger.debug(f"[MEMORY] Stats: {mem_stats}")
 
         # Update trace with final output and status

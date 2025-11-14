@@ -13,24 +13,15 @@ import json
 import re
 import time
 from datetime import datetime
-from enum import Enum
 from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI
 from openai.types.chat import ChatCompletionChunk
 
-from .base import Agent
+from .base import Agent, ToolCallingMode
 from .models import AgentMetrics, AgentResponse, Citation
 from .tool_base import BaseTool
 from ..graph.state import SharedState
 from ..di import ILogger, ITelemetry
-from linus.agents.agent.memory import MemoryManager
-
-
-class ToolCallingMode(Enum):
-    """Tool calling mode for LightAgent."""
-    NATIVE = "native"      # Use OpenAI native function calling
-    MANUAL = "manual"      # Parse tool calls from text (for models without native support)
-    AUTO = "auto"          # Auto-detect based on model name
 
 
 class LightAgent(Agent):
@@ -41,15 +32,42 @@ class LightAgent(Agent):
     - Native function calling (tools parameter in chat completions) for supported models
     - Manual tool calling for models without native support (Gemma, Llama, etc.)
     - Auto-detection of tool calling capabilities
-    - Simpler reasoning without multi-phase planning
+    - Tree of Thought reasoning for complex tasks
+    - Adaptive tool filtering based on task analysis
+    - Self-learning from memory context
     - Optional streaming support
     - Task transfer within agent swarms
+    - Dynamic tool creation
 
     Key features:
-    - AUTO mode: Automatically detects if model supports native function calling
-    - NATIVE mode: Uses OpenAI tool calling (for GPT-4, Claude, etc.)
-    - MANUAL mode: Parses tool calls from text (for Gemma, Llama, etc.)
-    - Works with any OpenAI-compatible endpoint (OpenAI, Ollama, etc.)
+    - **Tool Calling Modes:**
+      - AUTO mode: Automatically detects if model supports native function calling
+      - NATIVE mode: Uses OpenAI tool calling (for GPT-4, Claude, etc.)
+      - MANUAL mode: Parses tool calls from text (for Gemma, Llama, etc.)
+
+    - **Tree of Thought (ToT):**
+      - Enables multi-phase reasoning: initial thought → reflection → refinement
+      - Adaptive tool filtering based on task requirements
+      - Separate reasoning model support for better planning
+
+    - **Memory & Learning:**
+      - Context-aware memory integration
+      - Self-learning mode: agents learn from previous interactions
+      - User preference tracking
+
+    - **Agent Swarms:**
+      - Automatic task transfer between agents based on capabilities
+      - Intent detection for routing requests
+      - Collaborative agent workflows
+
+    - **MCP Integration:**
+      - Compatible with Model Context Protocol (MCP) servers
+      - Use mcp_client.py to add MCP tools to the agent
+
+    - **Extensibility:**
+      - Dynamic tool creation from natural language descriptions
+      - WebSocket support for streaming
+      - Works with any OpenAI-compatible endpoint (OpenAI, Ollama, etc.)
     """
 
     def __init__(
@@ -62,7 +80,7 @@ class LightAgent(Agent):
         output_schema: Optional[Type[BaseModel]] = None,
         output_key: Optional[str] = None,
         state: Optional[SharedState] = None,
-        memory_manager: Optional[MemoryManager] = None,
+        memory: Optional[SharedState] = None,
         # LightAgent-specific parameters
         instructions: str = "You are a helpful AI assistant.",
         role: Optional[str] = None,
@@ -72,6 +90,16 @@ class LightAgent(Agent):
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         stream: bool = False,
+        # Tree of Thought parameters
+        tree_of_thought: bool = False,
+        tot_model: Optional[str] = None,
+        tot_llm: Optional[Union[AsyncOpenAI, OpenAI]] = None,
+        # Tool filtering
+        filter_tools: bool = True,
+        # Self-learning
+        self_learning: bool = False,
+        # WebSocket support
+        websocket_base_url: Optional[str] = None,
         # Tool calling mode
         tool_calling_mode: Union[ToolCallingMode, str] = ToolCallingMode.AUTO,
         # Integration parameters
@@ -90,7 +118,7 @@ class LightAgent(Agent):
             output_schema: Optional Pydantic BaseModel for structured output
             output_key: Optional key to save output in shared state
             state: Optional SharedState instance for state management
-            memory_manager: Optional memory manager for context persistence
+            memory: Optional SharedState instance for conversation history (uses ConversationMemoryBackend)
             instructions: System instructions for the agent
             role: Optional role description for the agent
             max_tool_iterations: Maximum tool calling iterations (default: 10)
@@ -99,6 +127,12 @@ class LightAgent(Agent):
             top_p: Nucleus sampling parameter
             top_k: Top-k sampling parameter (Ollama-specific)
             stream: Enable streaming responses (default: False)
+            tree_of_thought: Enable Tree of Thought reasoning (default: False)
+            tot_model: Model for ToT reasoning (defaults to main model)
+            tot_llm: Separate LLM client for ToT (defaults to main llm)
+            filter_tools: Enable adaptive tool filtering based on task (default: True)
+            self_learning: Enable self-learning from memory (default: False)
+            websocket_base_url: WebSocket base URL for streaming
             tool_calling_mode: Tool calling mode - AUTO (default), NATIVE, or MANUAL
                 - AUTO: Auto-detect based on model name
                 - NATIVE: Force native OpenAI function calling
@@ -107,9 +141,11 @@ class LightAgent(Agent):
             telemetry: Optional telemetry instance
             agent_name: Optional name for the agent
         """
+        # Pass tool_calling_mode to base class
         super().__init__(
             llm, model, tools, verbose, input_schema, output_schema,
-            output_key, state, memory_manager, logger, telemetry, agent_name
+            output_key, state, memory, tool_calling_mode,
+            logger, telemetry, agent_name
         )
 
         # LightAgent-specific configuration
@@ -121,21 +157,19 @@ class LightAgent(Agent):
         self.top_p = top_p
         self.top_k = top_k
         self.stream = stream
+        self.websocket_base_url = websocket_base_url
 
-        # Tool calling mode configuration
-        # Convert string to enum if needed
-        if isinstance(tool_calling_mode, str):
-            tool_calling_mode = ToolCallingMode(tool_calling_mode.lower())
+        # Tree of Thought configuration
+        self.tree_of_thought = tree_of_thought
+        self.tot_model = tot_model or model
+        self.tot_llm = tot_llm or llm
 
-        self.tool_calling_mode = tool_calling_mode
+        # Tool filtering and self-learning
+        self.filter_tools = filter_tools
+        self.self_learning = self_learning
 
-        # Determine active mode (resolve AUTO to NATIVE or MANUAL)
-        if tool_calling_mode == ToolCallingMode.AUTO:
-            self.active_mode = self._detect_tool_calling_mode()
-            self.logger.info(f"[LIGHT-AGENT] Auto-detected tool calling mode: {self.active_mode.value}")
-        else:
-            self.active_mode = tool_calling_mode
-            self.logger.info(f"[LIGHT-AGENT] Using configured tool calling mode: {self.active_mode.value}")
+        # Use active_mode from base class (already set by base __init__)
+        self.active_mode = self.active_tool_mode
 
         # Message history for conversation
         self.messages: List[Dict[str, Any]] = []
@@ -145,51 +179,6 @@ class LightAgent(Agent):
 
         # Swarm context (set by Swarm when agent is part of one)
         self.swarm: Optional[Any] = None
-
-    def _detect_tool_calling_mode(self) -> ToolCallingMode:
-        """Auto-detect if model supports native function calling.
-
-        Returns:
-            ToolCallingMode.NATIVE if model supports native tools, MANUAL otherwise
-        """
-        # Models known to support native function calling
-        native_supported_models = [
-            # OpenAI models
-            "gpt-4", "gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o",
-            # Anthropic Claude
-            "claude-3", "claude-2",
-            # Google models
-            "gemini-pro", "gemini-1.5", "gemini-2",
-            # Mistral
-            "mistral-large", "mistral-medium", "mistral-small",
-            # Other providers with native support
-            "command-r", "dbrx"
-        ]
-
-        model_lower = self.model.lower()
-
-        # Check if model name contains any known native-supported model
-        for supported in native_supported_models:
-            if supported in model_lower:
-                return ToolCallingMode.NATIVE
-
-        # Models known to NOT support native function calling (require manual mode)
-        manual_only_models = [
-            "gemma", "llama", "phi", "qwen", "vicuna", "alpaca",
-            "orca", "wizardlm", "nous-hermes"
-        ]
-
-        for manual in manual_only_models:
-            if manual in model_lower:
-                return ToolCallingMode.MANUAL
-
-        # Default to MANUAL for unknown models to be safe
-        # (models can always fall back to manual mode)
-        self.logger.warning(
-            f"[LIGHT-AGENT] Unknown model '{self.model}', defaulting to MANUAL mode. "
-            f"Use tool_calling_mode='native' to force native function calling."
-        )
-        return ToolCallingMode.MANUAL
 
     def _get_generation_kwargs(self) -> Dict[str, Any]:
         """Build kwargs for LLM generation."""
@@ -210,10 +199,13 @@ class LightAgent(Agent):
 
         return kwargs
 
-    def _build_system_message(self) -> str:
+    def _build_system_message(self, tot_context: str = "") -> str:
         """Build the system message with instructions and role.
 
         For MANUAL mode, includes tool descriptions and calling format.
+
+        Args:
+            tot_context: Optional Tree of Thought reasoning context to include
         """
         now = datetime.now()
         current_date = now.strftime("%Y-%m-%d")
@@ -227,6 +219,10 @@ class LightAgent(Agent):
 
         message += f"\nCurrent date: {current_date}\n"
         message += f"Current time: {current_time}\n"
+
+        # Add Tree of Thought context if provided
+        if tot_context:
+            message += f"\n## Supplementary Analysis\n{tot_context}\n"
 
         # Add tool descriptions for MANUAL mode
         if self.active_mode == ToolCallingMode.MANUAL and self.tools:
@@ -270,104 +266,12 @@ class LightAgent(Agent):
 
         return instructions
 
-    def _convert_tools_to_openai_format(self) -> List[Dict[str, Any]]:
-        """Convert BaseTool instances to OpenAI function calling format."""
-        openai_tools = []
-
-        for tool in self.tools:
-            # Get tool schema
-            tool_schema = {}
-            if hasattr(tool, 'args_schema') and tool.args_schema:
-                if hasattr(tool.args_schema, 'model_json_schema'):
-                    schema = tool.args_schema.model_json_schema()
-                    tool_schema = {
-                        "type": "object",
-                        "properties": schema.get("properties", {}),
-                        "required": schema.get("required", [])
-                    }
-
-            openai_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool_schema
-                }
-            }
-
-            openai_tools.append(openai_tool)
-
-        return openai_tools
-
-    def _extract_tool_call_from_text(self, text: str) -> Optional[Dict[str, Any]]:
-        """Extract tool call from model response text (for MANUAL mode).
-
-        Looks for JSON in format: {"tool": "tool_name", "arguments": {...}}
-
-        Args:
-            text: Model response text
-
-        Returns:
-            Dictionary with 'tool' and 'arguments' keys, or None if no tool call found
-        """
-        if not text:
-            return None
-
-        # Strategy 1: Look for JSON in markdown code blocks
-        code_block_patterns = [
-            r'```json\s*(\{[^`]*"tool"[^`]*\})\s*```',
-            r'```\s*(\{[^`]*"tool"[^`]*\})\s*```'
-        ]
-
-        for pattern in code_block_patterns:
-            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-            if match:
-                try:
-                    tool_call = json.loads(match.group(1))
-                    if "tool" in tool_call and "arguments" in tool_call:
-                        self.logger.debug(f"[LIGHT-AGENT] Extracted tool call from code block: {tool_call['tool']}")
-                        return tool_call
-                except json.JSONDecodeError:
-                    pass
-
-        # Strategy 2: Look for JSON object with "tool" and "arguments" keys
-        json_pattern = r'\{[^{}]*"tool"[^{}]*"arguments"[^{}]*\}'
-        matches = re.finditer(json_pattern, text, re.DOTALL)
-
-        for match in matches:
-            try:
-                tool_call = json.loads(match.group())
-                if "tool" in tool_call and "arguments" in tool_call:
-                    self.logger.debug(f"[LIGHT-AGENT] Extracted tool call from JSON: {tool_call['tool']}")
-                    return tool_call
-            except json.JSONDecodeError:
-                continue
-
-        # Strategy 3: More lenient - find any JSON object, check if it looks like a tool call
-        json_objects = re.finditer(r'\{[^{}]*\}', text, re.DOTALL)
-        for match in json_objects:
-            try:
-                obj = json.loads(match.group())
-                # Check if it has tool-like structure
-                if isinstance(obj, dict) and "tool" in obj:
-                    # If it has "tool" key, assume arguments are the rest
-                    if "arguments" not in obj:
-                        # Gather all other keys as arguments
-                        arguments = {k: v for k, v in obj.items() if k != "tool"}
-                        obj["arguments"] = arguments
-
-                    self.logger.debug(f"[LIGHT-AGENT] Extracted lenient tool call: {obj['tool']}")
-                    return obj
-            except json.JSONDecodeError:
-                continue
-
-        return None
-
     async def run(
         self,
         input_data: Union[str, BaseModel, Dict[str, Any]],
         return_metrics: bool = True,
-        history: Optional[List[Dict[str, Any]]] = None
+        history: Optional[List[Dict[str, Any]]] = None,
+        light_swarm: Optional[Any] = None
     ) -> Union[str, BaseModel, AgentResponse]:
         """Run the agent on the given input.
 
@@ -375,12 +279,19 @@ class LightAgent(Agent):
             input_data: The user's request
             return_metrics: If True, return AgentResponse with metrics
             history: Optional conversation history
+            light_swarm: Optional LightSwarm instance for agent transfer
 
         Returns:
             AgentResponse (if return_metrics=True) or just the result
         """
         # Validate and convert input
         input_text = self._validate_and_convert_input(input_data)
+
+        # Check for agent transfer if swarm is available
+        if light_swarm:
+            transfer_result = await self._handle_task_transfer(input_text, light_swarm, return_metrics, history)
+            if transfer_result is not None:
+                return transfer_result
 
         # Start tracing
         async with self.telemetry.trace_agent_run(
@@ -424,11 +335,22 @@ class LightAgent(Agent):
 
         self.logger.info(f"[LIGHT-AGENT-NATIVE] Starting native mode execution")
 
+        # Run Tree of Thought if enabled
+        tot_context = ""
+        active_tools = []
+        if self.tree_of_thought:
+            self.logger.info("[LIGHT-AGENT-NATIVE] Running Tree of Thought...")
+            tot_response, filtered_tools = await self.run_thought(input_text)
+            tot_context = tot_response
+            if filtered_tools:
+                active_tools = filtered_tools
+            self.logger.debug(f"[LIGHT-AGENT-NATIVE] ToT filtered {len(active_tools)} tools")
+
         # Build messages
         messages = []
 
-        # Add system message
-        system_message = self._build_system_message()
+        # Add system message (with ToT context if available)
+        system_message = self._build_system_message(tot_context)
         messages.append({"role": "system", "content": system_message})
 
         # Add history if provided
@@ -436,14 +358,23 @@ class LightAgent(Agent):
             messages.extend(history)
 
         # Add memory context if available
-        if self.memory_manager:
-            memory_context = self.memory_manager.get_context(
+        if self.memory:
+            # User preferences/history
+            memory_context = self.get_memory_context(
                 max_tokens=1000,
-                include_summary=True,
                 query=input_text
             )
             if memory_context:
-                messages.append({"role": "system", "content": f"Context from memory:\n{memory_context}"})
+                messages.append({"role": "system", "content": f"## User Preferences\nThe user previously mentioned:\n{memory_context}"})
+
+            # Self-learning: Agent's own learned knowledge
+            if self.self_learning:
+                agent_memory = self.get_memory_context(
+                    max_tokens=500,
+                    query=input_text
+                )
+                if agent_memory:
+                    messages.append({"role": "system", "content": f"## Relevant Supplementary Information\n{agent_memory}"})
 
         # Add user message
         messages.append({"role": "user", "content": input_text})
@@ -451,8 +382,11 @@ class LightAgent(Agent):
         # Store messages for potential history access
         self.messages = messages.copy()
 
-        # Convert tools to OpenAI format
-        openai_tools = self._convert_tools_to_openai_format()
+        # Convert tools to OpenAI format (use filtered tools if available)
+        if active_tools:
+            openai_tools = active_tools
+        else:
+            openai_tools = self._convert_tools_to_openai_format()
 
         # Track execution
         citations = []
@@ -596,12 +530,11 @@ class LightAgent(Agent):
             metrics.task_completed = final_response is not None
 
             # Store in memory if available
-            if self.memory_manager and final_response:
-                self.memory_manager.add_memory(
+            if self.memory and final_response:
+                self.add_memory(
                     content=f"User: {input_text}\nAssistant: {final_response[:500]}",
-                    metadata={"role": "interaction", "type": "completion"},
-                    importance=1.0,
-                    entry_type="interaction"
+                    source="interaction",
+                    metadata={"role": "interaction", "type": "completion"}
                 )
 
             # Format output
@@ -675,11 +608,19 @@ class LightAgent(Agent):
 
         self.logger.info(f"[LIGHT-AGENT-MANUAL] Starting manual mode execution")
 
+        # Run Tree of Thought if enabled
+        tot_context = ""
+        if self.tree_of_thought:
+            self.logger.info("[LIGHT-AGENT-MANUAL] Running Tree of Thought...")
+            tot_response, _ = await self.run_thought(input_text)
+            tot_context = tot_response
+            self.logger.debug(f"[LIGHT-AGENT-MANUAL] ToT context added")
+
         # Build messages
         messages = []
 
-        # Add system message (includes tool descriptions)
-        system_message = self._build_system_message()
+        # Add system message (includes tool descriptions and ToT context)
+        system_message = self._build_system_message(tot_context)
         messages.append({"role": "system", "content": system_message})
 
         # Add history if provided
@@ -687,14 +628,23 @@ class LightAgent(Agent):
             messages.extend(history)
 
         # Add memory context if available
-        if self.memory_manager:
-            memory_context = self.memory_manager.get_context(
+        if self.memory:
+            # User preferences/history
+            memory_context = self.get_memory_context(
                 max_tokens=1000,
-                include_summary=True,
                 query=input_text
             )
             if memory_context:
-                messages.append({"role": "system", "content": f"Context from memory:\n{memory_context}"})
+                messages.append({"role": "system", "content": f"## User Preferences\nThe user previously mentioned:\n{memory_context}"})
+
+            # Self-learning: Agent's own learned knowledge
+            if self.self_learning:
+                agent_memory = self.get_memory_context(
+                    max_tokens=500,
+                    query=input_text
+                )
+                if agent_memory:
+                    messages.append({"role": "system", "content": f"## Relevant Supplementary Information\n{agent_memory}"})
 
         # Add user message
         messages.append({"role": "user", "content": input_text})
@@ -833,12 +783,11 @@ class LightAgent(Agent):
             metrics.task_completed = final_response is not None
 
             # Store in memory if available
-            if self.memory_manager and final_response:
-                self.memory_manager.add_memory(
+            if self.memory and final_response:
+                self.add_memory(
                     content=f"User: {input_text}\nAssistant: {final_response[:500]}",
-                    metadata={"role": "interaction", "type": "completion"},
-                    importance=1.0,
-                    entry_type="interaction"
+                    source="interaction",
+                    metadata={"role": "interaction", "type": "completion"}
                 )
 
             # Format output
@@ -908,3 +857,356 @@ class LightAgent(Agent):
     def clear_history(self):
         """Clear the conversation history."""
         self.messages = []
+
+    def get_tool(self, tool_name: str) -> BaseTool:
+        """Get a loaded tool by name.
+
+        Args:
+            tool_name: Name of the tool to retrieve
+
+        Returns:
+            The tool instance
+
+        Raises:
+            ValueError: If tool is not found
+        """
+        if tool_name in self.tool_map:
+            return self.tool_map[tool_name]
+        raise ValueError(f"Tool `{tool_name}` is not loaded.")
+
+    async def run_thought(self, query: str) -> tuple:
+        """Use Tree of Thought reasoning to plan tool usage.
+
+        This method:
+        1. Generates an initial plan with tool usage
+        2. Reflects on the plan to refine it
+        3. Extracts and filters the most relevant tools
+
+        Args:
+            query: The user's query to analyze
+
+        Returns:
+            Tuple of (refined_reasoning, filtered_tools)
+        """
+        if not self.tree_of_thought:
+            self.logger.warning("[LIGHT-AGENT] run_thought called but tree_of_thought is disabled")
+            return "", []
+
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
+
+        # Build tool descriptions
+        tools_str = self._get_tools_description_str()
+
+        system_prompt = f"""You are an intelligent assistant. Based on the user's question, analyze the task and plan which tools to use.
+
+Today's date: {current_date}
+Current time: {current_time}
+
+Available tools:
+{tools_str}
+
+Please analyze the task step by step and identify which tools are needed."""
+
+        self.logger.debug(f"[LIGHT-AGENT-TOT] Starting Tree of Thought for: {query}")
+
+        try:
+            # Phase 1: Initial thought generation
+            tot_client = self.tot_llm if isinstance(self.tot_llm, AsyncOpenAI) else self.llm
+
+            params = {
+                "model": self.tot_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ],
+                "temperature": 0.8,  # Higher temperature for creative reasoning
+            }
+
+            response = await tot_client.chat.completions.create(**params)
+            thought_response = response.choices[0].message.content
+            self.logger.debug(f"[LIGHT-AGENT-TOT] Initial thought: {thought_response[:200]}...")
+
+            # Phase 2: Reflection
+            reflection_prompt = """Please reflect on your answer. Ensure you only use tools from the <Available tools> list.
+Do not create or mention tools that don't exist. Output a refined plan focusing ONLY on available tools."""
+
+            reflection_params = {
+                "model": self.tot_model,
+                "messages": [
+                    {"role": "user", "content": f"{system_prompt}\n\nQuestion: {query}"},
+                    {"role": "assistant", "content": thought_response},
+                    {"role": "user", "content": reflection_prompt}
+                ],
+                "temperature": 0.7,
+            }
+
+            reflection_response = await tot_client.chat.completions.create(**reflection_params)
+            refined_content = reflection_response.choices[0].message.content
+            self.logger.debug(f"[LIGHT-AGENT-TOT] Reflection: {refined_content[:200]}...")
+
+            # Phase 3: Extract tool names
+            if self.filter_tools:
+                tool_reflection_prompt = """Based on the analysis, output ONLY a JSON object listing the tools needed.
+Use this exact format:
+{"tools": [{"name": "tool_name1"}, {"name": "tool_name2"}]}
+
+Only include tools from the available tools list. No explanations, just JSON."""
+
+                tool_params = {
+                    "model": self.tot_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Question: {query}"},
+                        {"role": "assistant", "content": refined_content},
+                        {"role": "user", "content": tool_reflection_prompt}
+                    ],
+                    "temperature": 0.3,  # Lower temperature for structured output
+                }
+
+                tool_response = await tot_client.chat.completions.create(**tool_params)
+                tool_reflection_result = tool_response.choices[0].message.content
+                self.logger.debug(f"[LIGHT-AGENT-TOT] Tool extraction: {tool_reflection_result}")
+
+                # Filter tools
+                filtered_tools = self._filter_tools_from_response(tool_reflection_result)
+                self.logger.info(f"[LIGHT-AGENT-TOT] Filtered {len(filtered_tools)} tools")
+
+                return refined_content, filtered_tools
+            else:
+                return refined_content, []
+
+        except Exception as e:
+            self.logger.exception(f"[LIGHT-AGENT-TOT] Error during Tree of Thought: {e}")
+            return "", []
+
+    def _get_tools_description_str(self) -> str:
+        """Get formatted string of all available tools."""
+        tool_descriptions = []
+        for tool in self.tools:
+            tool_descriptions.append(f"- {tool.name}: {tool.description}")
+        return "\n".join(tool_descriptions)
+
+    def _filter_tools_from_response(self, tool_reflection_result: str) -> List[Dict[str, Any]]:
+        """Filter tools based on LLM response.
+
+        Args:
+            tool_reflection_result: JSON string with tool names
+
+        Returns:
+            List of tool schemas in OpenAI format
+        """
+        try:
+            # Clean up JSON (remove markdown code blocks if present)
+            refined_content = tool_reflection_result.strip()
+            if refined_content.startswith('```json') and refined_content.endswith('```'):
+                refined_content = refined_content[7:-3].strip()
+            elif refined_content.startswith('```') and refined_content.endswith('```'):
+                refined_content = refined_content[3:-3].strip()
+
+            # Parse JSON
+            parsed_data = json.loads(refined_content)
+            valid_tool_names = {tool["name"].strip().lower() for tool in parsed_data.get("tools", [])}
+
+            # Convert tools to OpenAI format
+            openai_tools = self._convert_tools_to_openai_format()
+
+            # Filter based on valid tool names
+            filtered = [
+                schema for schema in openai_tools
+                if isinstance(schema, dict) and
+                   schema.get("function", {}).get("name", "").strip().lower() in valid_tool_names
+            ]
+
+            return filtered
+
+        except (json.JSONDecodeError, KeyError, AttributeError) as e:
+            self.logger.exception(f"[LIGHT-AGENT] Tool filtering failed: {e}")
+            return []
+
+    async def _handle_task_transfer(
+        self,
+        query: str,
+        light_swarm: Any,
+        return_metrics: bool,
+        history: Optional[List[Dict[str, Any]]]
+    ) -> Optional[Union[str, BaseModel, AgentResponse]]:
+        """Handle task transfer to another agent if needed.
+
+        Args:
+            query: User's query
+            light_swarm: LightSwarm instance containing registered agents
+            return_metrics: Whether to return metrics
+            history: Conversation history
+
+        Returns:
+            Result from transferred agent, or None if no transfer needed
+        """
+        try:
+            intent = await self._detect_intent(query, light_swarm)
+            if intent and intent.get("transfer_to"):
+                target_agent_name = intent["transfer_to"]
+                self.logger.info(f"[LIGHT-AGENT-TRANSFER] Detected transfer to: {target_agent_name}")
+
+                # Don't transfer to self
+                if target_agent_name == self.agent_name:
+                    self.logger.info("[LIGHT-AGENT-TRANSFER] Transfer to self detected, ignoring")
+                    return None
+
+                # Get target agent
+                if not hasattr(light_swarm, 'agents') or target_agent_name not in light_swarm.agents:
+                    self.logger.warning(f"[LIGHT-AGENT-TRANSFER] Target agent '{target_agent_name}' not found")
+                    return None
+
+                target_agent = light_swarm.agents[target_agent_name]
+
+                # Transfer to target agent
+                self.logger.info(f"[LIGHT-AGENT-TRANSFER] Transferring from {self.agent_name} to {target_agent_name}")
+                return await target_agent.run(
+                    input_data=query,
+                    return_metrics=return_metrics,
+                    history=history,
+                    light_swarm=light_swarm
+                )
+
+            return None
+
+        except Exception as e:
+            self.logger.exception(f"[LIGHT-AGENT-TRANSFER] Error during task transfer: {e}")
+            return None
+
+    async def _detect_intent(self, query: str, light_swarm: Any) -> Optional[Dict[str, str]]:
+        """Detect if the query should be transferred to another agent.
+
+        Args:
+            query: User's query
+            light_swarm: LightSwarm instance
+
+        Returns:
+            Dictionary with transfer_to key if transfer is needed, None otherwise
+        """
+        if not light_swarm or not hasattr(light_swarm, 'agents'):
+            return None
+
+        # Build agent information
+        agents_info = []
+        for agent_name, agent in light_swarm.agents.items():
+            if hasattr(agent, 'instructions'):
+                agents_info.append(f"Agent: {agent_name}, Instructions: {agent.instructions}")
+            else:
+                agents_info.append(f"Agent: {agent_name}")
+
+        agents_info_str = "\n".join(agents_info)
+
+        # Prompt for intent detection
+        prompt = f"""Analyze the user's request and determine if it should be handled by a different agent.
+
+Available agents:
+{agents_info_str}
+
+User request: {query}
+
+If the request should be transferred to another agent, respond with ONLY:
+transfer to <agent_name>
+
+Otherwise, respond with:
+no transfer
+
+Your response:"""
+
+        try:
+            # Use main LLM for intent detection
+            response = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.3,
+                max_tokens=50
+            )
+
+            intent_text = response.choices[0].message.content.strip().lower()
+            self.logger.debug(f"[LIGHT-AGENT-INTENT] Detected: {intent_text}")
+
+            # Parse intent
+            for agent_name in light_swarm.agents.keys():
+                if f"transfer to {agent_name.lower()}" in intent_text:
+                    return {"transfer_to": agent_name}
+
+            return None
+
+        except Exception as e:
+            self.logger.exception(f"[LIGHT-AGENT-INTENT] Error detecting intent: {e}")
+            return None
+
+    async def create_tool(self, user_input: str) -> Optional[str]:
+        """Create a new tool dynamically based on user description.
+
+        This method uses the LLM to generate Python code for a new tool
+        based on the user's description.
+
+        Args:
+            user_input: Description of the tool to create
+
+        Returns:
+            The name of the created tool, or None if creation failed
+        """
+        system_prompt = """You are a Python code generator. Generate a tool function based on the user's description.
+
+Output ONLY valid JSON in this format:
+{
+    "tool_name": "function_name",
+    "tool_code": "import statements\\ndef function_name(param: type) -> str:\\n    ...\\n    return result"
+}
+
+The tool_code should:
+1. Include necessary imports
+2. Have a descriptive function name
+3. Include type hints
+4. Have a docstring
+5. Return a string result
+
+Example:
+{
+    "tool_name": "get_weather",
+    "tool_code": "import requests\\ndef get_weather(city: str) -> str:\\n    \\\"\\\"\\\"Get weather for a city\\\"\\\"\\\"\\n    # Implementation\\n    return 'Weather data'"
+}"""
+
+        try:
+            response = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Create a tool for: {user_input}"}
+                ],
+                temperature=0.7
+            )
+
+            response_text = response.choices[0].message.content
+            self.logger.debug(f"[LIGHT-AGENT-CREATE-TOOL] Generated: {response_text[:200]}...")
+
+            # Parse JSON response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                tool_data = json.loads(json_match.group())
+            else:
+                tool_data = json.loads(response_text)
+
+            tool_name = tool_data.get("tool_name")
+            tool_code = tool_data.get("tool_code")
+
+            if not tool_name or not tool_code:
+                self.logger.error("[LIGHT-AGENT-CREATE-TOOL] Missing tool_name or tool_code")
+                return None
+
+            self.logger.info(f"[LIGHT-AGENT-CREATE-TOOL] Created tool: {tool_name}")
+            self.logger.debug(f"[LIGHT-AGENT-CREATE-TOOL] Code:\n{tool_code}")
+
+            # Note: Actually registering the tool would require dynamic code execution
+            # which is a security risk. This method primarily demonstrates the capability.
+            # In production, generated code should be reviewed before execution.
+
+            return tool_name
+
+        except Exception as e:
+            self.logger.exception(f"[LIGHT-AGENT-CREATE-TOOL] Error creating tool: {e}")
+            return None

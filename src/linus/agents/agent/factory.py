@@ -12,15 +12,7 @@ from .light_agent import LightAgent
 from .swarm import Swarm
 from .tool_base import BaseTool
 from .config import AgentParams, LLMConfig, MemoryConfig, StateConfig
-from ..graph.state import SharedState
-
-# Import memory components
-try:
-    from .memory import MemoryManager, create_memory_manager
-    MEMORY_AVAILABLE = True
-except ImportError:
-    MEMORY_AVAILABLE = False
-    logger.warning("Memory module not available")
+from ..graph.state import SharedState, ConversationMemoryBackend
 
 
 # Example usage function
@@ -104,20 +96,16 @@ def Agent(
     if tools is None:
         tools = []
 
-    # Create memory manager if enabled
-    memory_manager = None
-    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
-        memory_manager = create_memory_manager(
-            backend_type=params.memory_config.memory_backend,
+    # Create memory if enabled (using SharedState with ConversationMemoryBackend)
+    memory = None
+    if params.memory_config.enable_memory:
+        memory = SharedState(
+            backend=ConversationMemoryBackend(max_size=params.memory_config.max_memory_size),
             max_context_tokens=params.memory_config.max_context_tokens,
-            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
-            llm=llm,
-            model=params.llm_config.model,
-            max_size=params.memory_config.max_memory_size
+            llm_client=llm,
+            model=params.llm_config.model
         )
-        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend with OpenAI client")
-    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
-        logger.warning("[MEMORY] Memory requested but module not available")
+        logger.info(f"[MEMORY] Initialized conversation memory backend with max_size={params.memory_config.max_memory_size}")
 
     agent = ReasoningAgent(
         llm=llm,
@@ -129,7 +117,7 @@ def Agent(
         output_key=output_key,
         state=state,
         max_iterations=max_iterations,
-        memory_manager=memory_manager,
+        memory=memory,
         memory_context_ratio=memory_context_ratio,
         temperature=params.temperature,
         max_tokens=params.max_tokens,
@@ -252,20 +240,16 @@ def Coordinator(
     if tools is None:
         tools = []
 
-    # Create memory manager if enabled
-    memory_manager = None
-    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
-        memory_manager = create_memory_manager(
-            backend_type=params.memory_config.memory_backend,
+    # Create memory if enabled (using SharedState with ConversationMemoryBackend)
+    memory = None
+    if params.memory_config.enable_memory:
+        memory = SharedState(
+            backend=ConversationMemoryBackend(max_size=params.memory_config.max_memory_size),
             max_context_tokens=params.memory_config.max_context_tokens,
-            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
-            llm=llm,
-            model=params.llm_config.model,
-            max_size=params.memory_config.max_memory_size
+            llm_client=llm,
+            model=params.llm_config.model
         )
-        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend")
-    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
-        logger.warning("[MEMORY] Memory requested but module not available")
+        logger.info(f"[MEMORY] Initialized conversation memory backend with max_size={params.memory_config.max_memory_size}")
 
     coordinator = CoordinatorAgent(
         llm=llm,
@@ -278,7 +262,7 @@ def Coordinator(
         output_key=output_key,
         state=state,
         max_iterations=max_iterations,
-        memory_manager=memory_manager,
+        memory=memory,
         memory_context_ratio=memory_context_ratio,
         temperature=params.temperature,
         max_tokens=params.max_tokens,
@@ -420,20 +404,16 @@ def TreeOfThought(
     if tools is None:
         tools = []
 
-    # Create memory manager if enabled
-    memory_manager = None
-    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
-        memory_manager = create_memory_manager(
-            backend_type=params.memory_config.memory_backend,
+    # Create memory if enabled (using SharedState with ConversationMemoryBackend)
+    memory = None
+    if params.memory_config.enable_memory:
+        memory = SharedState(
+            backend=ConversationMemoryBackend(max_size=params.memory_config.max_memory_size),
             max_context_tokens=params.memory_config.max_context_tokens,
-            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
-            llm=llm,
-            model=params.llm_config.model,
-            max_size=params.memory_config.max_memory_size
+            llm_client=llm,
+            model=params.llm_config.model
         )
-        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend for ToT agent")
-    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
-        logger.warning("[MEMORY] Memory requested but module not available")
+        logger.info(f"[MEMORY] Initialized conversation memory backend for ToT agent with max_size={params.memory_config.max_memory_size}")
 
     agent = TreeOfThoughtAgent(
         llm=llm,
@@ -445,7 +425,7 @@ def TreeOfThought(
         output_key=output_key,
         state=state,
         max_iterations=max_iterations,
-        memory_manager=memory_manager,
+        memory=memory,
         reasoning_model=reasoning_model or params.llm_config.model,
         reasoning_llm=reasoning_llm,
         enable_tool_filtering=enable_tool_filtering,
@@ -579,20 +559,16 @@ def Light(
     if tools is None:
         tools = []
 
-    # Create memory manager if enabled
-    memory_manager = None
-    if params.memory_config.enable_memory and MEMORY_AVAILABLE:
-        memory_manager = create_memory_manager(
-            backend_type=params.memory_config.memory_backend,
+    # Create memory if enabled (using SharedState with ConversationMemoryBackend)
+    memory = None
+    if params.memory_config.enable_memory:
+        memory = SharedState(
+            backend=ConversationMemoryBackend(max_size=params.memory_config.max_memory_size),
             max_context_tokens=params.memory_config.max_context_tokens,
-            summary_threshold_tokens=int(params.memory_config.max_context_tokens * 0.5),
-            llm=llm,
-            model=params.llm_config.model,
-            max_size=params.memory_config.max_memory_size
+            llm_client=llm,
+            model=params.llm_config.model
         )
-        logger.info(f"[MEMORY] Initialized {params.memory_config.memory_backend} memory backend for LightAgent")
-    elif params.memory_config.enable_memory and not MEMORY_AVAILABLE:
-        logger.warning("[MEMORY] Memory requested but module not available")
+        logger.info(f"[MEMORY] Initialized conversation memory backend for LightAgent with max_size={params.memory_config.max_memory_size}")
 
     agent = LightAgent(
         llm=llm,
@@ -603,7 +579,7 @@ def Light(
         output_schema=output_schema,
         output_key=output_key,
         state=state,
-        memory_manager=memory_manager,
+        memory=memory,
         instructions=instructions,
         role=role,
         max_tool_iterations=max_tool_iterations,

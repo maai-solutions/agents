@@ -1,9 +1,11 @@
-"""Shared state management for agent orchestration."""
+"""Shared state management for agent orchestration with pluggable backends."""
 
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from abc import ABC, abstractmethod
+from collections import deque
 import json
 from loguru import logger
 
@@ -42,14 +44,234 @@ class StateEntry:
         }
 
 
+class StateBackend(ABC):
+    """Abstract base class for state storage backends.
+
+    Similar to MemoryBackend but designed for SharedState architecture.
+    Backends handle storage and retrieval logic while SharedState handles
+    token counting, summarization, and context formatting.
+    """
+
+    @abstractmethod
+    def add(self, entry: StateEntry) -> None:
+        """Add a state entry to the backend.
+
+        Args:
+            entry: StateEntry to store
+        """
+        pass
+
+    @abstractmethod
+    def get(self, key: str) -> Optional[StateEntry]:
+        """Get a specific entry by key.
+
+        Args:
+            key: State key to retrieve
+
+        Returns:
+            StateEntry or None if not found
+        """
+        pass
+
+    @abstractmethod
+    def get_all(self) -> List[StateEntry]:
+        """Get all state entries.
+
+        Returns:
+            List of all StateEntry objects
+        """
+        pass
+
+    @abstractmethod
+    def get_recent(self, limit: int = 10) -> List[StateEntry]:
+        """Get recent state entries sorted by timestamp.
+
+        Args:
+            limit: Maximum number of entries to return
+
+        Returns:
+            List of recent StateEntry objects
+        """
+        pass
+
+    @abstractmethod
+    def delete(self, key: str) -> None:
+        """Delete an entry by key.
+
+        Args:
+            key: State key to delete
+        """
+        pass
+
+    @abstractmethod
+    def clear(self) -> None:
+        """Clear all state entries."""
+        pass
+
+    @abstractmethod
+    def count(self) -> int:
+        """Count total number of entries.
+
+        Returns:
+            Number of entries in backend
+        """
+        pass
+
+
+class KeyValueBackend(StateBackend):
+    """Key-value storage backend (default SharedState behavior).
+
+    Stores state as key-value pairs with history tracking.
+    """
+
+    def __init__(self):
+        """Initialize key-value backend."""
+        self._state: Dict[str, StateEntry] = {}
+        self._history: List[StateEntry] = []
+
+    def add(self, entry: StateEntry) -> None:
+        """Add/update a state entry."""
+        self._state[entry.key] = entry
+        self._history.append(entry)
+        logger.debug(f"[KV-BACKEND] Set '{entry.key}' (source: {entry.source})")
+
+    def get(self, key: str) -> Optional[StateEntry]:
+        """Get entry by key."""
+        return self._state.get(key)
+
+    def get_all(self) -> List[StateEntry]:
+        """Get all current state entries."""
+        return list(self._state.values())
+
+    def get_recent(self, limit: int = 10) -> List[StateEntry]:
+        """Get recent entries from history."""
+        return sorted(self._history, key=lambda e: e.timestamp, reverse=True)[:limit]
+
+    def delete(self, key: str) -> None:
+        """Delete a key from state."""
+        if key in self._state:
+            del self._state[key]
+            logger.debug(f"[KV-BACKEND] Deleted '{key}'")
+
+    def clear(self) -> None:
+        """Clear all state and history."""
+        self._state.clear()
+        self._history.clear()
+        logger.info("[KV-BACKEND] Cleared all state")
+
+    def count(self) -> int:
+        """Count entries."""
+        return len(self._state)
+
+    def get_history(self, key: Optional[str] = None) -> List[StateEntry]:
+        """Get state change history.
+
+        Args:
+            key: Optional key to filter history
+
+        Returns:
+            List of state entries
+        """
+        if key is None:
+            return self._history.copy()
+        return [entry for entry in self._history if entry.key == key]
+
+
+class ConversationMemoryBackend(StateBackend):
+    """Conversation memory backend for storing interaction history.
+
+    Replaces the old MemoryManager with a StateBackend implementation.
+    Stores conversations as sequential entries (not key-value pairs).
+    """
+
+    def __init__(self, max_size: Optional[int] = None):
+        """Initialize conversation memory backend.
+
+        Args:
+            max_size: Maximum number of conversation entries (None = unlimited)
+        """
+        self.max_size = max_size
+        self.conversations: deque = deque(maxlen=max_size)
+        self._counter = 0  # For generating unique keys
+
+    def add(self, entry: StateEntry) -> None:
+        """Add a conversation entry.
+
+        For conversations, the key is auto-generated if not provided.
+        The value should be the conversation text.
+        """
+        # Auto-generate key if needed
+        if not entry.key or entry.key.startswith("auto_"):
+            entry.key = f"conversation_{self._counter}"
+            self._counter += 1
+
+        self.conversations.append(entry)
+        logger.debug(f"[CONV-BACKEND] Added: {str(entry.value)[:50]}...")
+
+    def get(self, key: str) -> Optional[StateEntry]:
+        """Get a specific conversation by key."""
+        for entry in self.conversations:
+            if entry.key == key:
+                return entry
+        return None
+
+    def get_all(self) -> List[StateEntry]:
+        """Get all conversation entries."""
+        return list(self.conversations)
+
+    def get_recent(self, limit: int = 10) -> List[StateEntry]:
+        """Get recent conversation entries."""
+        all_entries = list(self.conversations)
+        return sorted(all_entries, key=lambda e: e.timestamp, reverse=True)[:limit]
+
+    def delete(self, key: str) -> None:
+        """Delete a conversation entry by key."""
+        self.conversations = deque(
+            (e for e in self.conversations if e.key != key),
+            maxlen=self.max_size
+        )
+        logger.debug(f"[CONV-BACKEND] Deleted '{key}'")
+
+    def clear(self) -> None:
+        """Clear all conversations."""
+        self.conversations.clear()
+        self._counter = 0
+        logger.info("[CONV-BACKEND] Cleared all conversations")
+
+    def count(self) -> int:
+        """Count conversation entries."""
+        return len(self.conversations)
+
+    def search(self, query: str, limit: int = 5) -> List[StateEntry]:
+        """Search conversations by keyword.
+
+        Args:
+            query: Search query
+            limit: Maximum results
+
+        Returns:
+            List of matching StateEntry objects
+        """
+        query_lower = query.lower()
+        matches = [
+            entry for entry in self.conversations
+            if query_lower in str(entry.value).lower()
+        ]
+        # Sort by timestamp (most recent first)
+        matches.sort(key=lambda e: e.timestamp, reverse=True)
+        return matches[:limit]
+
+
 class SharedState:
     """Shared state that can be accessed by all agents in the DAG.
 
     Supports token-aware context management to prevent prompt overflow.
+    Uses pluggable backends for flexible storage (key-value, conversation memory, etc.).
     """
 
     def __init__(
         self,
+        backend: Optional[StateBackend] = None,
         max_context_tokens: Optional[int] = None,
         summary_threshold_tokens: Optional[int] = None,
         llm_client: Optional[Any] = None,
@@ -60,6 +282,7 @@ class SharedState:
         """Initialize shared state.
 
         Args:
+            backend: Storage backend (defaults to KeyValueBackend)
             max_context_tokens: Maximum tokens for state context (None = no limit)
             summary_threshold_tokens: When to trigger summarization (for COMPACT strategy)
             llm_client: OpenAI-compatible client for COMPACT strategy
@@ -67,8 +290,9 @@ class SharedState:
             encoding_name: Tiktoken encoding name
             context_strategy: Default strategy for get_context() calls
         """
-        self._state: Dict[str, StateEntry] = {}
-        self._history: List[StateEntry] = []
+        # Use provided backend or default to KeyValueBackend
+        self.backend = backend or KeyValueBackend()
+
         self.max_context_tokens = max_context_tokens
         self.summary_threshold_tokens = summary_threshold_tokens or (max_context_tokens // 2 if max_context_tokens else None)
         self.llm_client = llm_client
@@ -76,7 +300,7 @@ class SharedState:
         self.context_strategy = context_strategy
         self._summary: Optional[str] = None
 
-        # Initialize tokenizer (inspired by MemoryManager)
+        # Initialize tokenizer
         self.encoding = None
         if TIKTOKEN_AVAILABLE:
             try:
@@ -110,9 +334,7 @@ class SharedState:
             metadata=metadata or {}
         )
 
-        self._state[key] = entry
-        self._history.append(entry)
-
+        self.backend.add(entry)
         logger.debug(f"[STATE] Set '{key}' = {str(value)[:100]} (source: {source})")
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -125,7 +347,7 @@ class SharedState:
         Returns:
             Value associated with key or default
         """
-        entry = self._state.get(key)
+        entry = self.backend.get(key)
         if entry is None:
             logger.debug(f"[STATE] Get '{key}' = {default} (not found)")
             return default
@@ -142,7 +364,7 @@ class SharedState:
         Returns:
             True if key exists
         """
-        return key in self._state
+        return self.backend.get(key) is not None
 
     def delete(self, key: str) -> None:
         """Delete a key from state.
@@ -150,9 +372,7 @@ class SharedState:
         Args:
             key: State key
         """
-        if key in self._state:
-            del self._state[key]
-            logger.debug(f"[STATE] Deleted '{key}'")
+        self.backend.delete(key)
 
     def get_entry(self, key: str) -> Optional[StateEntry]:
         """Get the full state entry with metadata.
@@ -163,7 +383,7 @@ class SharedState:
         Returns:
             StateEntry or None
         """
-        return self._state.get(key)
+        return self.backend.get(key)
 
     def get_all(self) -> Dict[str, Any]:
         """Get all state values as dictionary.
@@ -171,10 +391,11 @@ class SharedState:
         Returns:
             Dictionary of all state values
         """
-        return {key: entry.value for key, entry in self._state.items()}
+        entries = self.backend.get_all()
+        return {entry.key: entry.value for entry in entries}
 
     def get_history(self, key: Optional[str] = None) -> List[StateEntry]:
-        """Get state change history.
+        """Get state change history (if backend supports it).
 
         Args:
             key: Optional key to filter history
@@ -182,13 +403,20 @@ class SharedState:
         Returns:
             List of state entries
         """
+        # Try to get history from backend if it supports it (like KeyValueBackend)
+        if hasattr(self.backend, 'get_history'):
+            return self.backend.get_history(key)
+
+        # Fallback: return all entries filtered by key
+        all_entries = self.backend.get_all()
         if key is None:
-            return self._history.copy()
-        return [entry for entry in self._history if entry.key == key]
+            return all_entries
+        return [entry for entry in all_entries if entry.key == key]
 
     def clear(self) -> None:
         """Clear all state."""
-        self._state.clear()
+        self.backend.clear()
+        self._summary = None  # Clear summary as well
         logger.info("[STATE] Cleared all state")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -197,10 +425,8 @@ class SharedState:
         Returns:
             Dictionary with all state entries
         """
-        return {
-            key: entry.to_dict()
-            for key, entry in self._state.items()
-        }
+        entries = self.backend.get_all()
+        return {entry.key: entry.to_dict() for entry in entries}
 
     def count_tokens(self, text: str) -> int:
         """Count tokens in text.
@@ -219,7 +445,7 @@ class SharedState:
 
     def get_context(
         self,
-        strategy: StateContextStrategy = StateContextStrategy.FULL,
+        strategy: Optional[StateContextStrategy] = None,
         max_tokens: Optional[int] = None,
         include_summary: bool = True
     ) -> str:
@@ -228,16 +454,17 @@ class SharedState:
         Inspired by MemoryManager.get_context() but adapted for state data.
 
         Args:
-            strategy: Context management strategy (FULL, CLIP, or COMPACT)
+            strategy: Context management strategy (FULL, CLIP, or COMPACT), defaults to self.context_strategy
             max_tokens: Maximum tokens (uses self.max_context_tokens if None)
             include_summary: Whether to include summary for COMPACT strategy
 
         Returns:
             Formatted state string ready for prompt
         """
-        if not self._state:
+        if self.backend.count() == 0:
             return ""
 
+        strategy = strategy or self.context_strategy
         max_tokens = max_tokens or self.max_context_tokens
 
         if strategy == StateContextStrategy.FULL:
@@ -268,7 +495,7 @@ class SharedState:
                 f"Consider using CLIP or COMPACT strategy."
             )
 
-        logger.debug(f"[STATE] Full context: {tokens} tokens, {len(self._state)} entries")
+        logger.debug(f"[STATE] Full context: {tokens} tokens, {self.backend.count()} entries")
         return f"\n\nShared state: {state_json}"
 
     def _get_clipped_context(self, max_tokens: Optional[int]) -> str:
@@ -286,8 +513,9 @@ class SharedState:
             logger.debug("[STATE] No max_tokens specified for CLIP strategy, using FULL")
             return self._get_full_context(None)
 
-        # Sort entries by timestamp (most recent first)
-        sorted_entries = sorted(self._state.values(), key=lambda e: e.timestamp, reverse=True)
+        # Get all entries and sort by timestamp (most recent first)
+        all_entries = self.backend.get_all()
+        sorted_entries = sorted(all_entries, key=lambda e: e.timestamp, reverse=True)
 
         clipped_state = {}
         current_tokens = 0
@@ -323,10 +551,10 @@ class SharedState:
             return ""
 
         state_json = json.dumps(clipped_state, indent=2)
-        dropped_count = len(self._state) - included_count
+        dropped_count = self.backend.count() - included_count
 
         logger.info(
-            f"[STATE] CLIP context: kept {included_count}/{len(self._state)} entries "
+            f"[STATE] CLIP context: kept {included_count}/{self.backend.count()} entries "
             f"({current_tokens} tokens, dropped {dropped_count} oldest)"
         )
 
@@ -403,7 +631,7 @@ class SharedState:
             logger.warning("[STATE] No LLM client provided for summarization")
             return
 
-        if not self._state:
+        if self.backend.count() == 0:
             return
 
         # Format state for summarization
@@ -469,22 +697,49 @@ Return ONLY the summary in a clear, structured format. Do not include explanatio
         total_tokens = self.count_tokens(state_json)
 
         stats = {
-            "total_entries": len(self._state),
+            "total_entries": self.backend.count(),
             "total_tokens": total_tokens,
             "has_summary": self._summary is not None,
             "summary_tokens": self.count_tokens(self._summary) if self._summary else 0,
-            "max_context_tokens": self.max_context_tokens,
-            "history_length": len(self._history)
+            "max_context_tokens": self.max_context_tokens
         }
+
+        # Include history length if backend supports it
+        if hasattr(self.backend, 'get_history'):
+            history = self.backend.get_history()
+            stats["history_length"] = len(history)
 
         if self.max_context_tokens:
             stats["utilization"] = total_tokens / self.max_context_tokens
 
         return stats
 
+    def search(self, query: str, limit: int = 5) -> List[StateEntry]:
+        """Search state entries (if backend supports search).
+
+        Args:
+            query: Search query
+            limit: Maximum results
+
+        Returns:
+            List of matching StateEntry objects
+        """
+        if hasattr(self.backend, 'search'):
+            return self.backend.search(query, limit)
+
+        # Fallback: simple keyword search on all entries
+        query_lower = query.lower()
+        all_entries = self.backend.get_all()
+        matches = [
+            entry for entry in all_entries
+            if query_lower in str(entry.value).lower()
+        ]
+        matches.sort(key=lambda e: e.timestamp, reverse=True)
+        return matches[:limit]
+
     def __repr__(self) -> str:
         """String representation."""
-        return f"SharedState(entries={len(self._state)})"
+        return f"SharedState(backend={self.backend.__class__.__name__}, entries={self.backend.count()})"
 
 
 class StateManager:
@@ -501,7 +756,8 @@ class StateManager:
         Returns:
             Snapshot ID
         """
-        snapshot = self.current_state._state.copy()
+        # Create snapshot of all backend entries
+        snapshot = {entry.key: entry for entry in self.current_state.backend.get_all()}
         self._snapshots.append(snapshot)
         snapshot_id = len(self._snapshots) - 1
         logger.info(f"[STATE] Created snapshot #{snapshot_id}")
@@ -514,7 +770,11 @@ class StateManager:
             snapshot_id: Snapshot ID to restore
         """
         if 0 <= snapshot_id < len(self._snapshots):
-            self.current_state._state = self._snapshots[snapshot_id].copy()
+            # Clear current state and restore from snapshot
+            self.current_state.clear()
+            snapshot = self._snapshots[snapshot_id]
+            for entry in snapshot.values():
+                self.current_state.backend.add(entry)
             logger.info(f"[STATE] Restored snapshot #{snapshot_id}")
         else:
             raise ValueError(f"Invalid snapshot ID: {snapshot_id}")

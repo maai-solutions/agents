@@ -7,6 +7,10 @@ This agent implements the Tree of Thought (ToT) reasoning approach where:
 4. Finally, it executes the plan using the main execution model
 
 This is particularly useful for complex tasks that benefit from deliberate planning.
+
+The agent now supports BOTH native function calling (for GPT-4, Claude, etc.)
+AND manual tool calling (for Gemma, Llama, and other models without native support).
+The mode is auto-detected based on the model name, but can be manually overridden.
 """
 
 from typing import List, Dict, Any, Optional, Type, Union
@@ -17,12 +21,11 @@ from datetime import datetime
 from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI
 
-from .base import Agent
+from .base import Agent, ToolCallingMode
 from .models import AgentMetrics, AgentResponse, Citation
 from .tool_base import BaseTool
 from ..graph.state import SharedState
 from ..di import ILogger, ITelemetry
-from linus.agents.agent.memory import MemoryManager
 
 
 class ThoughtNode(BaseModel):
@@ -67,7 +70,7 @@ class TreeOfThoughtAgent(Agent):
         output_key: Optional[str] = None,
         state: Optional[SharedState] = None,
         max_iterations: int = 10,
-        memory_manager: Optional[MemoryManager] = None,
+        memory: Optional[SharedState] = None,
         # ToT-specific parameters
         reasoning_model: Optional[str] = None,
         reasoning_llm: Optional[Union[AsyncOpenAI, OpenAI]] = None,
@@ -80,6 +83,7 @@ class TreeOfThoughtAgent(Agent):
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         reasoning_temperature: float = 0.8,  # Higher temperature for creative reasoning
+        tool_calling_mode: Union[ToolCallingMode, str] = ToolCallingMode.AUTO,
         logger: Optional[ILogger] = None,
         telemetry: Optional[ITelemetry] = None,
         agent_name: Optional[str] = None,
@@ -96,7 +100,7 @@ class TreeOfThoughtAgent(Agent):
             output_key: Optional key to save output in shared state
             state: Optional SharedState instance for state management
             max_iterations: Maximum number of execution iterations
-            memory_manager: Optional memory manager for context persistence
+            memory: Optional SharedState instance for conversation history (uses ConversationMemoryBackend)
             reasoning_model: Model name for reasoning phase (defaults to main model)
             reasoning_llm: Separate LLM client for reasoning (defaults to main llm)
             enable_tool_filtering: Whether to filter tools based on task analysis
@@ -107,13 +111,15 @@ class TreeOfThoughtAgent(Agent):
             top_p: Nucleus sampling parameter
             top_k: Top-k sampling parameter
             reasoning_temperature: Temperature for reasoning phase (higher for creativity)
+            tool_calling_mode: Tool calling mode - AUTO (default), NATIVE, or MANUAL
             logger: Optional logger instance
             telemetry: Optional telemetry instance
             agent_name: Optional name for the agent
         """
         super().__init__(
             llm, model, tools, verbose, input_schema, output_schema,
-            output_key, state, memory_manager, logger, telemetry, agent_name
+            output_key, state, memory, tool_calling_mode,
+            logger, telemetry, agent_name
         )
 
         # ToT-specific configuration
